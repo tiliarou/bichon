@@ -36,13 +36,40 @@ pub(crate) fn socket_type_to_encryption(raw: &str) -> Encryption {
     }
 }
 
+/// Check if the configuration is for a Yahoo Mail account
+fn is_yahoo_config(config: &MailConfig) -> bool {
+    config.incoming.iter().any(|s| {
+        s.hostname.contains("yahoo") 
+            || s.hostname.contains("ymail") 
+            || s.hostname.contains("rocketmail")
+    })
+}
+
 /// Convert the raw `MailConfig` discovered by `client::fetch` into a
 /// `MailServerConfig` suitable for account provisioning.
+/// 
+/// For Yahoo Mail accounts, prioritizes the export IMAP server (export.imap.mail.yahoo.com)
+/// for better archive retrieval. Falls back to the standard IMAP server if the export
+/// server is not available.
 pub(crate) fn mail_config_to_server_config(config: &MailConfig) -> Option<MailServerConfig> {
-    let imap = config.incoming.iter().find(|s| {
-        let p = s.protocol.to_ascii_lowercase();
-        p == "imap" || p == "imaps"
-    })?;
+    // For Yahoo Mail, try to prioritize the export server
+    let imap = if is_yahoo_config(config) {
+        // Try export server first, then fall back to standard IMAP server
+        config.incoming.iter().find(|s| {
+            let p = s.protocol.to_ascii_lowercase();
+            (p == "imap" || p == "imaps") && s.hostname.contains("export.imap")
+        }).or_else(|| {
+            config.incoming.iter().find(|s| {
+                let p = s.protocol.to_ascii_lowercase();
+                p == "imap" || p == "imaps"
+            })
+        })
+    } else {
+        config.incoming.iter().find(|s| {
+            let p = s.protocol.to_ascii_lowercase();
+            p == "imap" || p == "imaps"
+        })
+    }?;
 
     let encryption = socket_type_to_encryption(&imap.socket_type);
     let port = if imap.port != 0 {
