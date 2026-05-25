@@ -306,3 +306,51 @@ fn convert_case_insensitive_protocol() {
     let result = mail_config_to_server_config(&config).expect("should recognize 'IMAP'");
     assert_eq!(result.imap.host, "imap.example.com");
 }
+
+// ---------------------------------------------------------------------------
+// Yahoo Mail export server prioritization tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn yahoo_prioritizes_export_imap_server() {
+    let config = MailConfig {
+        incoming: vec![
+            make_imap_server("imap.mail.yahoo.com", 993, "SSL"),
+            IncomingServer {
+                protocol: "imap".to_string(),
+                hostname: "export.imap.mail.yahoo.com".to_string(),
+                port: 993,
+                socket_type: "SSL".to_string(),
+                username: "%EMAILADDRESS%".to_string(),
+            },
+        ],
+        outgoing: vec![],
+    };
+    let result = mail_config_to_server_config(&config).expect("should find IMAP");
+    assert_eq!(result.imap.host, "export.imap.mail.yahoo.com");
+}
+
+#[test]
+fn yahoo_falls_back_to_standard_imap() {
+    let config = MailConfig {
+        incoming: vec![
+            make_imap_server("imap.mail.yahoo.com", 993, "SSL"),
+        ],
+        outgoing: vec![],
+    };
+    let result = mail_config_to_server_config(&config).expect("should find IMAP");
+    assert_eq!(result.imap.host, "imap.mail.yahoo.com");
+}
+
+#[test]
+fn non_yahoo_uses_first_imap_server() {
+    let config = MailConfig {
+        incoming: vec![
+            make_imap_server("imap.example.com", 993, "SSL"),
+            make_imap_server("imap2.example.com", 993, "SSL"),
+        ],
+        outgoing: vec![],
+    };
+    let result = mail_config_to_server_config(&config).expect("should find IMAP");
+    assert_eq!(result.imap.host, "imap.example.com");
+}
