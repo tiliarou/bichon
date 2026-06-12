@@ -51,7 +51,11 @@ pub enum FetchDirection {
 }
 
 /// Extracts the maximum UID from an IMAP sequence set string.
-/// Examples: "1:5" -> 5, "1,3,5:10" -> 10, "42" -> 42
+/// Handles all RFC 3501 sequence set formats:
+/// - Single UID:     "42"       -> 42
+/// - Range:          "1:5"      -> 5
+/// - Mixed list:     "1,3,5:10" -> 10
+/// - Unordered:      "5:10,1:3" -> 10
 fn extract_max_uid_from_sequence(sequence: &str) -> Option<u32> {
     sequence
         .split(',')
@@ -61,6 +65,21 @@ fn extract_max_uid_from_sequence(sequence: &str) -> Option<u32> {
                 .max()
         })
         .max()
+}
+
+/// Generates a synthetic UIDVALIDITY for IMAP servers that don't provide one.
+///
+/// Uses the first 4 bytes of a Blake3 hash of the mailbox name, with bit 31
+/// forced to 1 to avoid 0 (which is reserved by RFC 3501).
+///
+/// Blake3 is deterministic and stable across Rust compiler versions and
+/// platforms, unlike `std::collections::hash_map::DefaultHasher`.
+fn generate_synthetic_uidvalidity(mailbox_name: &str) -> u32 {
+    let hash = blake3::hash(mailbox_name.as_bytes());
+    let bytes = hash.as_bytes();
+    let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // Set bit 31 to guarantee the value is >= 2^31 and never 0.
+    value | 0x8000_0000
 }
 
 pub async fn fetch_and_save_by_date(
@@ -459,17 +478,6 @@ pub async fn fetch_and_save_full_mailbox(
     Ok(max_uid)
 }
 
-/// Generates a synthetic UIDVALIDITY for IMAP servers that don't provide it.
-/// Uses a stable hash of the mailbox name to ensure consistent IDs across sessions.
-fn generate_synthetic_uidvalidity(mailbox_name: &str) -> u32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    
-    let mut hasher = DefaultHasher::new();
-    mailbox_name.hash(&mut hasher);
-    (hasher.finish() as u32).wrapping_add(1) // Avoid 0, which might be reserved
-}
-
 pub async fn reconcile_mailboxes(
     account: &AccountModel,
     remote_mailboxes: &[MailBox],
@@ -502,7 +510,8 @@ pub async fn reconcile_mailboxes(
             let remote_uid_validity = match remote_mailbox.uid_validity {
                 Some(uid) => uid,
                 None => {
-                    // Generate a synthetic UIDVALIDITY based on mailbox name
+                    // Generate a synthetic UIDVALIDITY based on mailbox name.
+                    // Uses Blake3 for a stable, compiler-version-independent hash.
                     let synthetic_uid = generate_synthetic_uidvalidity(&remote_mailbox.name);
                     
                     warn!(
