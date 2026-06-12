@@ -44,11 +44,23 @@ use tracing::{debug, error, info, warn};
 
 const MAX_NETWORK_RETRIES: u32 = 3;
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FetchDirection {
     Since,
     Before,
+}
+
+/// Extracts the maximum UID from an IMAP sequence set string.
+/// Examples: "1:5" -> 5, "1,3,5:10" -> 10, "42" -> 42
+fn extract_max_uid_from_sequence(sequence: &str) -> Option<u32> {
+    sequence
+        .split(',')
+        .filter_map(|part| {
+            part.split(':')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .max()
+        })
+        .max()
 }
 
 pub async fn fetch_and_save_by_date(
@@ -213,6 +225,16 @@ pub async fn fetch_and_save_by_date(
         match batch_result {
             Ok(processed) => {
                 current_processed += processed;
+
+                // Extract the max UID from this batch and persist it.
+                // This ensures that if the sync is interrupted, we can resume from
+                // this batch on the next sync attempt instead of losing progress.
+                if let Some(batch_max_uid) = extract_max_uid_from_sequence(&batch.0) {
+                    let mut updated = mailbox.clone();
+                    updated.highest_uid = Some(batch_max_uid);
+                    MailBox::batch_upsert(&[updated])?;
+                }
+
                 DownloadState::update_folder_progress(
                     account_id,
                     mailbox.name.clone(),
@@ -388,6 +410,15 @@ pub async fn fetch_and_save_full_mailbox(
         match batch_result {
             Ok(count) => {
                 current_processed += count as u64;
+
+                // Persist highest_uid after each successful batch, so a crash between
+                // pages still records the last seen UID.
+                if let Some(uid) = max_uid {
+                    let mut updated = mailbox.clone();
+                    updated.highest_uid = Some(uid);
+                    MailBox::batch_upsert(&[updated])?;
+                }
+
                 DownloadState::update_folder_progress(
                     account_id,
                     mailbox.name.clone(),
