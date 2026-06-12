@@ -21,16 +21,18 @@ use crate::{
     raise_error,
 };
 
-/// Resets the sync state of a single mailbox so that the next sync
-/// cycle performs a **full fetch** instead of an incremental one.
+/// Schedules a forced full sync for a single mailbox.
 ///
-/// Concretely this clears:
-/// - `highest_uid`  → triggers `fetch_and_save_full_mailbox` on next run
-/// - `uid_next`     → stale, will be refreshed from IMAP EXAMINE
-/// - `exists`       → stale count, will be refreshed from IMAP EXAMINE
+/// Sets `force_full_sync = true` so that `perform_incremental_sync` bypasses
+/// both `highest_uid` and the Tantivy fallback on the next sync cycle,
+/// triggering `fetch_and_save_full_mailbox` unconditionally.
 ///
-/// The function does **not** delete any locally stored messages; it only
-/// resets the watermark used to decide where to resume downloading.
+/// Also clears `highest_uid`, `uid_next`, and `exists` so the watermark is
+/// fully reset in case the full sync is interrupted mid-way and the caller
+/// inspects these fields directly.
+///
+/// Does **not** delete any locally stored messages — deduplication is handled
+/// by the IMAP executor layer (`uid_batch_retrieve_emails` / `batch_retrieve_emails`).
 pub async fn reset_mailbox_sync_impl(account_id: u64, mailbox_id: u64) -> BichonResult<()> {
     let mut mailbox = MailBox::find_mailbox(account_id, mailbox_id)?
         .ok_or_else(|| {
@@ -43,7 +45,7 @@ pub async fn reset_mailbox_sync_impl(account_id: u64, mailbox_id: u64) -> Bichon
             )
         })?;
 
-    // Clear all sync-state fields so the next run starts from scratch.
+    mailbox.force_full_sync = true;
     mailbox.highest_uid = None;
     mailbox.uid_next = None;
     mailbox.exists = 0;

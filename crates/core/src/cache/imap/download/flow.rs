@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -71,14 +70,10 @@ fn extract_max_uid_from_sequence(sequence: &str) -> Option<u32> {
 ///
 /// Uses the first 4 bytes of a Blake3 hash of the mailbox name, with bit 31
 /// forced to 1 to avoid 0 (which is reserved by RFC 3501).
-///
-/// Blake3 is deterministic and stable across Rust compiler versions and
-/// platforms, unlike `std::collections::hash_map::DefaultHasher`.
 fn generate_synthetic_uidvalidity(mailbox_name: &str) -> u32 {
     let hash = blake3::hash(mailbox_name.as_bytes());
     let bytes = hash.as_bytes();
     let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    // Set bit 31 to guarantee the value is >= 2^31 and never 0.
     value | 0x8000_0000
 }
 
@@ -145,7 +140,6 @@ pub async fn fetch_and_save_by_date(
         return Ok(None);
     }
 
-    // sort small -> bigger
     let mut uid_vec: Vec<u32> = uid_list.into_iter().collect();
     uid_vec.sort();
 
@@ -184,7 +178,6 @@ pub async fn fetch_and_save_by_date(
             has_error_or_cancel = true;
             break;
         }
-        // Fetch metadata for the current batch of UIDs
         let mut retries = 0u32;
         let batch_result = loop {
             match ImapExecutor::uid_batch_retrieve_emails(
@@ -214,22 +207,15 @@ pub async fn fetch_and_save_by_date(
                     match ImapExecutor::create_connection(account_id).await {
                         Ok(new_session) => {
                             session = new_session;
-                            if let Err(e2) = session.examine(&mailbox.encoded_name()).await
-                            {
+                            if let Err(e2) = session.examine(&mailbox.encoded_name()).await {
                                 let err_msg = format!(
                                     "Re-examine failed after reconnect: {:#?}",
                                     e2
                                 );
-                                DownloadState::append_session_error(
-                                    account_id,
-                                    err_msg,
-                                )?;
+                                DownloadState::append_session_error(account_id, err_msg)?;
                                 break Err(e);
                             }
-                            tokio::time::sleep(Duration::from_secs(
-                                1 << (retries - 1),
-                            ))
-                            .await;
+                            tokio::time::sleep(Duration::from_secs(1 << (retries - 1))).await;
                             continue;
                         }
                         Err(e2) => {
@@ -244,16 +230,11 @@ pub async fn fetch_and_save_by_date(
         match batch_result {
             Ok(processed) => {
                 current_processed += processed;
-
-                // Extract the max UID from this batch and persist it.
-                // This ensures that if the sync is interrupted, we can resume from
-                // this batch on the next sync attempt instead of losing progress.
                 if let Some(batch_max_uid) = extract_max_uid_from_sequence(&batch.0) {
                     let mut updated = mailbox.clone();
                     updated.highest_uid = Some(batch_max_uid);
                     MailBox::batch_upsert(&[updated])?;
                 }
-
                 DownloadState::update_folder_progress(
                     account_id,
                     mailbox.name.clone(),
@@ -283,7 +264,7 @@ pub async fn fetch_and_save_by_date(
         DownloadState::update_folder_progress(
             account_id,
             mailbox.name.clone(),
-            planned,
+            current_processed,
             current_processed,
             FolderStatus::Success,
             None,
@@ -293,8 +274,15 @@ pub async fn fetch_and_save_by_date(
     Ok(max_uid)
 }
 
-/// Fetches all messages from a mailbox.
-/// Returns `Ok(Some(max_uid))` with the highest UID stored, or `Ok(None)` if empty.
+/// Fetches all messages from a mailbox in sequential pages.
+///
+/// Persists `highest_uid` after each successful page so a crash mid-fetch
+/// can be recovered. `force_full_sync` is kept `true` throughout and only
+/// cleared to `false` once the very last page succeeds, preventing the next
+/// sync cycle from switching to incremental mode too early.
+///
+/// Returns `Ok(Some(max_uid))` with the highest UID stored, or `Ok(None)` if
+/// the mailbox was empty.
 pub async fn fetch_and_save_full_mailbox(
     account: &AccountModel,
     mailbox: &MailBox,
@@ -321,7 +309,7 @@ pub async fn fetch_and_save_full_mailbox(
     };
 
     let total = match session.examine(&mailbox.encoded_name()).await {
-        Ok(mailbox) => mailbox.exists as u64,
+        Ok(mailbox_status) => mailbox_status.exists as u64,
         Err(e) => {
             let err_msg = format!("Failed to examine folder [{}]: {:#?}", mailbox.name, e);
             DownloadState::update_folder_progress(
@@ -332,7 +320,6 @@ pub async fn fetch_and_save_full_mailbox(
                 FolderStatus::Failed,
                 Some(err_msg.clone()),
             )?;
-
             DownloadState::append_session_error(account_id, err_msg)?;
             session.logout().await.ok();
             return Err(raise_error!(
@@ -399,7 +386,7 @@ pub async fn fetch_and_save_full_mailbox(
                         mailbox = mailbox.name,
                         page,
                         retries,
-                        "Network error on batch, reconnecting ({}/{})",
+                        "Network error on page, reconnecting ({}/{})",
                         retries,
                         MAX_NETWORK_RETRIES
                     );
@@ -429,15 +416,15 @@ pub async fn fetch_and_save_full_mailbox(
         match batch_result {
             Ok(count) => {
                 current_processed += count as u64;
-
-                // Persist highest_uid after each successful batch, so a crash between
-                // pages still records the last seen UID.
+                // Persist progress after each page.
+                // Keep force_full_sync=true until the fetch is fully complete
+                // so a crash here will restart the full fetch on next run.
                 if let Some(uid) = max_uid {
                     let mut updated = mailbox.clone();
                     updated.highest_uid = Some(uid);
+                    updated.force_full_sync = true;
                     MailBox::batch_upsert(&[updated])?;
                 }
-
                 DownloadState::update_folder_progress(
                     account_id,
                     mailbox.name.clone(),
@@ -448,7 +435,7 @@ pub async fn fetch_and_save_full_mailbox(
                 )?;
             }
             Err(e) => {
-                let err_msg = format!("Batch {} failed: {:#?}", page, e);
+                let err_msg = format!("Page {} failed: {:#?}", page, e);
                 DownloadState::append_session_error(account_id, err_msg.clone())?;
                 DownloadState::update_folder_progress(
                     account_id,
@@ -465,6 +452,14 @@ pub async fn fetch_and_save_full_mailbox(
     }
 
     if !has_error_or_cancel {
+        // Full fetch completed: clear force_full_sync so subsequent syncs
+        // resume incrementally from the new highest_uid.
+        if let Some(uid) = max_uid {
+            let mut updated = mailbox.clone();
+            updated.highest_uid = Some(uid);
+            updated.force_full_sync = false;
+            MailBox::batch_upsert(&[updated])?;
+        }
         DownloadState::update_folder_progress(
             account_id,
             mailbox.name.clone(),
@@ -505,22 +500,15 @@ pub async fn reconcile_mailboxes(
                 break;
             }
 
-            // Handle missing UIDVALIDITY from non-compliant IMAP servers
-            // (e.g., Tencent Enterprise Mail, etc.)
             let remote_uid_validity = match remote_mailbox.uid_validity {
                 Some(uid) => uid,
                 None => {
-                    // Generate a synthetic UIDVALIDITY based on mailbox name.
-                    // Uses Blake3 for a stable, compiler-version-independent hash.
                     let synthetic_uid = generate_synthetic_uidvalidity(&remote_mailbox.name);
-                    
                     warn!(
                         "Account {}: Mailbox '{}' - Server did not provide UIDVALIDITY. \
-                        Using synthetic UIDVALIDITY {} based on mailbox name. \
-                        This mailbox will be synced but may require periodic rebuilds if the server's mailbox structure changes.",
+                        Using synthetic UIDVALIDITY {} based on mailbox name.",
                         account_id, remote_mailbox.name, synthetic_uid
                     );
-                    
                     synthetic_uid
                 }
             };
@@ -528,10 +516,9 @@ pub async fn reconcile_mailboxes(
             let new_highest_uid = if local_mailbox.uid_validity != Some(remote_uid_validity) {
                 info!(
                     "Account {}: Mailbox '{}' detected with changed uid_validity (local: {:#?}, remote: {:#?}). \
-                    The mailbox data may be invalid, resetting its envelopes and rebuilding the cache.",
+                    Resetting envelopes and rebuilding the cache.",
                     account_id, local_mailbox.name, &local_mailbox.uid_validity, &remote_uid_validity
                 );
-
                 DownloadState::update_folder_progress(
                     account_id,
                     local_mailbox.name.clone(),
@@ -540,7 +527,6 @@ pub async fn reconcile_mailboxes(
                     FolderStatus::Downloading,
                     Some("UID validity changed, rebuilding...".into()),
                 )?;
-
                 match &account.date_since {
                     Some(date_since) => {
                         rebuild_mailbox_cache_by_date(
@@ -583,25 +569,21 @@ pub async fn reconcile_mailboxes(
 
             let mut updated = remote_mailbox.clone();
             updated.highest_uid = new_highest_uid;
-            // Update uid_validity with the resolved value (either from server or synthetic)
             if updated.uid_validity.is_none() {
                 updated.uid_validity = Some(remote_uid_validity);
             }
             mailboxes_to_update.push(updated);
         }
-        //The metadata of this mailbox must only be updated after a successful synchronization;
-        //otherwise, it may cause synchronization errors and result in missing emails in the local sync results.
         MailBox::batch_upsert(&mailboxes_to_update)?;
     }
 
     debug!(
-        "Checked mailbox folders for account ID: {}. Compared local and server folders to identify changes. Elapsed time: {} seconds",
+        "Checked mailbox folders for account ID: {}. Elapsed time: {} seconds",
         account.id,
         start_time.elapsed().as_secs()
     );
 
     let missing_mailboxes = find_missing_mailboxes(local_mailboxes, remote_mailboxes);
-    //Mail folders that are not locally need to be downloaded.
     if !missing_mailboxes.is_empty() {
         MailBox::batch_insert(&missing_mailboxes)?;
 
@@ -689,46 +671,56 @@ pub async fn reconcile_mailboxes(
     Ok(())
 }
 
-//only check new emails and sync
-/// Incrementally syncs a mailbox.
-/// Returns the new highest UID after sync, or `None` if nothing changed.
+/// Incrementally syncs a mailbox from the last known `highest_uid`.
+///
+/// Decision tree:
+/// 1. `force_full_sync == true`  → full fetch unconditionally (bypass Tantivy)
+/// 2. `highest_uid == Some(uid)` → incremental from `uid + 1`
+/// 3. `highest_uid == None`      → ask Tantivy for its max UID
+///    a. Tantivy has one         → incremental from `tantivy_max + 1`
+///    b. Tantivy is empty        → full fetch (first run)
 async fn perform_incremental_sync(
     account: &AccountModel,
     local_mailbox: &MailBox,
     remote_mailbox: &MailBox,
     token: CancellationToken,
 ) -> BichonResult<Option<u32>> {
+    // ── Case 1: forced full sync (e.g. after reset-mailbox-sync API call) ──
+    if local_mailbox.force_full_sync {
+        info!(
+            "[account {}][mailbox '{}'] force_full_sync=true — running full fetch.",
+            account.id, local_mailbox.name
+        );
+        return fetch_and_save_full_mailbox(account, remote_mailbox, token).await;
+    }
+
     if remote_mailbox.exists > 0 {
-        // Use stored highest_uid if available; otherwise fall back to Tantivy
-        // query once (backward compatibility with pre-existing databases).
         let start_uid = match local_mailbox.highest_uid {
+            // ── Case 2: normal incremental resume ──
             Some(uid) => {
-                tracing::info!(
-                    "[account {}][mailbox {}] perform_incremental_sync: stored highest_uid={}, remote.exists={}",
-                    account.id,
-                    local_mailbox.name,
-                    uid,
-                    remote_mailbox.exists
+                info!(
+                    "[account {}][mailbox '{}'] incremental sync: highest_uid={}, remote.exists={}",
+                    account.id, local_mailbox.name, uid, remote_mailbox.exists
                 );
                 uid as u64 + 1
             }
+            // ── Case 3: no watermark, fall back to Tantivy ──
             None => {
                 let local_max_uid =
                     ENVELOPE_MANAGER.get_max_uid(account.id, local_mailbox.id)?;
-                tracing::info!(
-                    "[account {}][mailbox {}] perform_incremental_sync: highest_uid unset, Tantivy max_uid={:?}, remote.exists={}",
-                    account.id,
-                    local_mailbox.name,
-                    local_max_uid,
-                    remote_mailbox.exists
+                info!(
+                    "[account {}][mailbox '{}'] no highest_uid, Tantivy max_uid={:?}, remote.exists={}",
+                    account.id, local_mailbox.name, local_max_uid, remote_mailbox.exists
                 );
                 match local_max_uid {
+                    // ── Case 3a: Tantivy has data, resume from there ──
                     Some(uid) => uid + 1,
+                    // ── Case 3b: Tantivy empty, first-run full fetch ──
                     None => {
                         info!(
-                            "No maximum UID found in index for mailbox, assuming local storage is missing."
+                            "[account {}][mailbox '{}'] Tantivy empty — triggering full fetch.",
+                            account.id, local_mailbox.name
                         );
-
                         let result = match &account.date_since {
                             Some(date_since) => {
                                 fetch_and_save_by_date(
@@ -752,10 +744,8 @@ async fn perform_incremental_sync(
                                     .await?
                                 }
                                 None => {
-                                    fetch_and_save_full_mailbox(
-                                        account, remote_mailbox, token,
-                                    )
-                                    .await?
+                                    fetch_and_save_full_mailbox(account, remote_mailbox, token)
+                                        .await?
                                 }
                             },
                         };
@@ -783,7 +773,6 @@ async fn perform_incremental_sync(
         .await?;
         session.logout().await.ok();
 
-        // Keep existing highest_uid if no new mail was fetched.
         Ok(new_max_uid.or(local_mailbox.highest_uid))
     } else {
         Ok(local_mailbox.highest_uid)

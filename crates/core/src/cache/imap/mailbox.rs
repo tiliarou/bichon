@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -60,6 +59,14 @@ pub struct MailBox {
     /// Used for incremental sync: next fetch starts from `highest_uid + 1`.
     /// If `None`, a fallback query against the Tantivy index will be performed once.
     pub highest_uid: Option<u32>,
+    /// When `true`, the next sync cycle must perform a full fetch from the IMAP server,
+    /// bypassing both `highest_uid` and the Tantivy fallback.
+    /// Automatically reset to `false` after a successful full fetch completes.
+    /// Set to `true` by the `reset-mailbox-sync` API endpoint.
+    /// Uses `#[serde(default)]` so existing serialised records without this field
+    /// deserialise cleanly with `false` — no DB migration needed.
+    #[serde(default)]
+    pub force_full_sync: bool,
 }
 
 impl MemDbModel for MailBox {
@@ -154,12 +161,11 @@ impl From<&Name> for MailBox {
         let name = decode_mailbox_name!(value.name().to_string());
         let delimiter = value.delimiter().map(|f| f.to_owned());
         let attributes: Vec<Attribute> = value.attributes().iter().map(|na| na.into()).collect();
-        //The remaining parts will be supplemented during the examine_mailbox process.
         MailBox {
             name,
             delimiter,
             attributes,
-            ..Default::default() //has_synced is initialized to false here
+            ..Default::default()
         }
     }
 }
