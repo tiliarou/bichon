@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -21,8 +20,10 @@ use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
 use bichon_core::mailbox::delete::delete_mailbox_impl;
 use bichon_core::mailbox::list::{get_account_mailboxes, MailboxListResponse};
+use bichon_core::mailbox::reset::reset_mailbox_sync_impl;
 use bichon_core::users::permissions::Permission;
-use poem_openapi::param::{Path, Query};
+use poem_openapi::param::Path;
+use poem_openapi::param::Query;
 use poem_openapi::payload::Json;
 use poem_openapi::OpenApi;
 
@@ -81,5 +82,39 @@ impl MailBoxApi {
         let mailbox_id = mailbox_id.0;
         context.require_permission(Some(account_id), Permission::DATA_DELETE)?;
         Ok(delete_mailbox_impl(account_id, mailbox_id).await?)
+    }
+
+    /// Resets the sync watermark of a mailbox so the next sync cycle
+    /// performs a **full fetch** from the IMAP server instead of an
+    /// incremental one.
+    ///
+    /// This is useful when a mailbox got partially synced (e.g. bug #286)
+    /// and you want to re-download everything without deleting local data.
+    ///
+    /// Clears `highest_uid`, `uid_next`, and `exists` on the mailbox record.
+    /// Does **not** delete any locally stored messages.
+    ///
+    /// Requires `ACCOUNT_WRITE` permission on the target account.
+    ///
+    /// # Parameters
+    /// - `account_id`: Account identifier.
+    /// - `mailbox_id`: Mailbox identifier.
+    #[oai(
+        path = "/reset-mailbox-sync/:account_id/:mailbox_id",
+        method = "post",
+        operation_id = "reset_mailbox_sync"
+    )]
+    async fn reset_mailbox_sync(
+        &self,
+        /// The unique identifier of the account.
+        account_id: Path<u64>,
+        /// The unique identifier of the mailbox to reset.
+        mailbox_id: Path<u64>,
+        context: WrappedContext,
+    ) -> ApiResult<()> {
+        let account_id = account_id.0;
+        let mailbox_id = mailbox_id.0;
+        context.require_permission(Some(account_id), Permission::ACCOUNT_WRITE)?;
+        Ok(reset_mailbox_sync_impl(account_id, mailbox_id).await?)
     }
 }

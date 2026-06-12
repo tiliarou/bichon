@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -18,3 +17,4 @@
 
 pub mod delete;
 pub mod list;
+pub mod reset;
