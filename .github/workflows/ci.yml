@@ -53,8 +53,14 @@ jobs:
           pnpm install
           pnpm run build
 
+      - name: Create test root dir
+        run: mkdir -p /tmp/bichon-test
+
       - name: Build (release)
         run: cargo build --release --target x86_64-unknown-linux-gnu
 
       - name: Run tests (core crate)
         run: cargo test -p bichon-core --release --target x86_64-unknown-linux-gnu
+        env:
+          BICHON_ROOT_DIR: /tmp/bichon-test
+          BICHON_ENCRYPT_PASSWORD: test-password-ci
