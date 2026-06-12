@@ -55,6 +55,7 @@ jobs:
         working-directory: ./web
         run: |
           pnpm install
+          pnpm dlx update-browserslist-db@latest
           pnpm run build
 
       - name: Create test root dir
