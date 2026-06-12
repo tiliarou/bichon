@@ -10,6 +10,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  BINARY_NAME: bichon-server
+  BINARY_CLI: bichon-cli
+  BINARY_ADMIN: bichon-admin
+  TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   build-and-test:
@@ -57,10 +61,32 @@ jobs:
         run: mkdir -p /tmp/bichon-test
 
       - name: Build (release)
-        run: cargo build --release --target x86_64-unknown-linux-gnu
+        run: cargo build --release --target ${{ env.TARGET }}
 
       - name: Run tests (core crate)
-        run: cargo test -p bichon-core --release --target x86_64-unknown-linux-gnu
+        run: cargo test -p bichon-core --release --target ${{ env.TARGET }}
         env:
           BICHON_ROOT_DIR: /tmp/bichon-test
           BICHON_ENCRYPT_PASSWORD: test-password-ci
+
+      - name: Strip binaries
+        run: |
+          strip target/${{ env.TARGET }}/release/${{ env.BINARY_NAME }}
+          strip target/${{ env.TARGET }}/release/${{ env.BINARY_CLI }}
+          strip target/${{ env.TARGET }}/release/${{ env.BINARY_ADMIN }}
+
+      - name: Package binaries
+        run: |
+          mkdir -p release
+          cp target/${{ env.TARGET }}/release/${{ env.BINARY_NAME }} release/
+          cp target/${{ env.TARGET }}/release/${{ env.BINARY_CLI }} release/
+          cp target/${{ env.TARGET }}/release/${{ env.BINARY_ADMIN }} release/
+          cp README.md LICENSE release/
+          tar -czvf bichon-${{ env.TARGET }}.tar.gz -C release .
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bichon-${{ env.TARGET }}
+          path: bichon-${{ env.TARGET }}.tar.gz
+          retention-days: 7
