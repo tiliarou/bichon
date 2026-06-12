@@ -71,12 +71,14 @@ jobs:
           BICHON_ENCRYPT_PASSWORD: test-password-ci
 
       - name: Strip binaries
+        if: always() && hashFiles(format('target/{0}/release/{1}', env.TARGET, env.BINARY_NAME)) != ''
         run: |
           strip target/${{ env.TARGET }}/release/${{ env.BINARY_NAME }}
           strip target/${{ env.TARGET }}/release/${{ env.BINARY_CLI }}
           strip target/${{ env.TARGET }}/release/${{ env.BINARY_ADMIN }}
 
       - name: Package binaries
+        if: always() && hashFiles(format('target/{0}/release/{1}', env.TARGET, env.BINARY_NAME)) != ''
         run: |
           mkdir -p release
           cp target/${{ env.TARGET }}/release/${{ env.BINARY_NAME }} release/
@@ -86,6 +88,7 @@ jobs:
           tar -czvf bichon-${{ env.TARGET }}.tar.gz -C release .
 
       - name: Upload binaries artifact
+        if: always() && hashFiles('bichon-*.tar.gz') != ''
         uses: actions/upload-artifact@v4
         with:
           name: bichon-${{ env.TARGET }}
