@@ -65,7 +65,15 @@ jobs:
         run: cargo build --release --target ${{ env.TARGET }}
 
       - name: Run tests (core crate)
-        run: cargo test -p bichon-core --release --target ${{ env.TARGET }}
+        # Skip tests that require local EML fixtures, live IMAP credentials,
+        # or a real on-disk Tantivy index — none of which are available in CI.
+        run: |
+          cargo test -p bichon-core --release --target ${{ env.TARGET }} -- \
+            --skip imap_tests::test1 \
+            --skip imap_tests::test667 \
+            --skip imap_tests::test_bulk_attachment_stripping_blake3 \
+            --skip imap_tests::testxx \
+            --skip migrate_tests::test_real_tantivy_dir
         env:
           BICHON_ROOT_DIR: /tmp/bichon-test
           BICHON_ENCRYPT_PASSWORD: test-password-ci
