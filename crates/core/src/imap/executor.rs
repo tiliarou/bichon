@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -49,6 +48,23 @@ fn classify_imap_error(e: &async_imap::error::Error) -> ErrorCode {
         async_imap::error::Error::ConnectionLost => ErrorCode::NetworkError,
         _ => ErrorCode::ImapCommandFailed,
     }
+}
+
+/// Extracts the maximum UID from an IMAP sequence set string.
+/// Handles all RFC 3501 sequence set formats:
+/// - Single UID:     "42"       -> 42
+/// - Range:          "1:5"      -> 5
+/// - Mixed list:     "1,3,5:10" -> 10
+/// - Unordered:      "5:10,1:3" -> 10
+fn extract_max_uid_from_sequence(sequence: &str) -> Option<u32> {
+    sequence
+        .split(',')
+        .filter_map(|part| {
+            part.split(':')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .max()
+        })
+        .max()
 }
 
 pub struct ImapExecutor;
@@ -133,6 +149,11 @@ impl ImapExecutor {
     /// Two-step approach for date-filtered incremental fetch: UID SEARCH first,
     /// then batch UID FETCH for matching UIDs. Uses standard IMAP syntax that
     /// works across all compliant servers.
+    ///
+    /// `highest_uid` is persisted to the mailbox row after each successful batch
+    /// so that an interruption mid-way can resume from the last completed batch
+    /// on the next run, matching the behaviour of `fetch_and_save_by_date` and
+    /// `fetch_and_save_full_mailbox`.
     async fn fetch_new_mail_with_before(
         session: &mut Session<Box<dyn SessionStream>>,
         account: &AccountModel,
@@ -211,6 +232,16 @@ impl ImapExecutor {
             )
             .await?;
             count += processed;
+
+            // Persist highest_uid after each successful batch so that an
+            // interruption mid-sync can resume from the last completed batch
+            // rather than re-downloading from the pre-run highest_uid.
+            if let Some(batch_max_uid) = extract_max_uid_from_sequence(&batch.0) {
+                let mut updated = mailbox.clone();
+                updated.highest_uid = Some(batch_max_uid);
+                MailBox::batch_upsert(&[updated])?;
+            }
+
             DownloadState::update_folder_progress(
                 account.id,
                 mailbox.name.clone(),
@@ -534,14 +565,6 @@ impl ImapExecutor {
             })?
             .to_vec();
 
-        // // Drain any remaining items so the stream is fully consumed before reuse.
-        // while stream
-        //     .try_next()
-        //     .await
-        //     .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?
-        //     .is_some()
-        // {}
-
         Ok(body)
     }
 
@@ -667,5 +690,32 @@ mod test {
         assert_eq!(batches[1].1, 2);
         assert_eq!(batches[2].0, "5");
         assert_eq!(batches[2].1, 1);
+    }
+
+    // ── extract_max_uid_from_sequence ──────────────────────────────
+
+    #[test]
+    fn extract_max_single_uid() {
+        assert_eq!(extract_max_uid_from_sequence("42"), Some(42));
+    }
+
+    #[test]
+    fn extract_max_range() {
+        assert_eq!(extract_max_uid_from_sequence("1:5"), Some(5));
+    }
+
+    #[test]
+    fn extract_max_mixed_list() {
+        assert_eq!(extract_max_uid_from_sequence("1,3,5:10"), Some(10));
+    }
+
+    #[test]
+    fn extract_max_unordered() {
+        assert_eq!(extract_max_uid_from_sequence("5:10,1:3"), Some(10));
+    }
+
+    #[test]
+    fn extract_max_empty() {
+        assert_eq!(extract_max_uid_from_sequence(""), None);
     }
 }
