@@ -187,7 +187,6 @@ impl ImapExecutor {
 
         let mut uid_vec: Vec<u32> = results.into_iter().collect();
         uid_vec.sort();
-        let max_uid = uid_vec.last().copied();
         let planned = uid_vec.len() as u64;
         let batch_size = account.download_batch_size.unwrap_or(DEFAULT_BATCH_SIZE) as usize;
         let uid_batches = generate_uid_sequence_hashset(uid_vec, batch_size);
@@ -202,6 +201,8 @@ impl ImapExecutor {
         )?;
 
         let mut count = 0u64;
+        // Tracks the highest UID actually indexed across all batches.
+        let mut overall_max_uid: Option<u32> = None;
         for batch in uid_batches {
             if token.is_cancelled() {
                 DownloadState::update_session_status(
@@ -222,7 +223,7 @@ impl ImapExecutor {
                     ErrorCode::InternalError
                 ));
             }
-            let processed = Self::uid_batch_retrieve_emails(
+            let (processed, batch_max_uid) = Self::uid_batch_retrieve_emails(
                 session,
                 account.id,
                 mailbox.id,
@@ -233,12 +234,15 @@ impl ImapExecutor {
             .await?;
             count += processed;
 
-            // Persist highest_uid after each successful batch so that an
-            // interruption mid-sync can resume from the last completed batch
-            // rather than re-downloading from the pre-run highest_uid.
-            if let Some(batch_max_uid) = extract_max_uid_from_sequence(&batch.0) {
+            // Persist highest_uid after each successful batch using the UID of
+            // the last email that was *actually indexed*, not the max UID of the
+            // request sequence. This prevents silently skipping oversized emails:
+            // if UIDs 60-79 were all skipped due to size, we do not advance the
+            // cursor to 79 — the next run will attempt them again.
+            if let Some(uid) = batch_max_uid {
+                overall_max_uid = Some(overall_max_uid.unwrap_or(0).max(uid));
                 let mut updated = mailbox.clone();
-                updated.highest_uid = Some(batch_max_uid);
+                updated.highest_uid = overall_max_uid;
                 MailBox::batch_upsert(&[updated])?;
             }
 
@@ -261,7 +265,7 @@ impl ImapExecutor {
             None,
         )?;
 
-        Ok(max_uid)
+        Ok(overall_max_uid)
     }
 
     /// Direct ranged UID FETCH without date filtering. Streams results from
@@ -324,6 +328,7 @@ impl ImapExecutor {
                 continue;
             }
 
+            // Update max_uid only for emails that will actually be indexed.
             if let Some(uid) = fetch.uid {
                 max_uid = Some(max_uid.unwrap_or(0).max(uid));
             }
@@ -453,6 +458,17 @@ impl ImapExecutor {
         Ok(count)
     }
 
+    /// Fetches a batch of emails identified by a UID sequence set string.
+    ///
+    /// Uses a two-pass strategy:
+    /// 1. Fetch SIZE only to filter oversized messages.
+    /// 2. Fetch full bodies only for acceptable UIDs.
+    ///
+    /// Returns `(count, max_uid_indexed)` where `count` is the number of emails
+    /// successfully indexed and `max_uid_indexed` is the highest UID among those
+    /// emails — **not** the highest UID in the request sequence. This distinction
+    /// matters when emails are skipped due to the size limit: the cursor must not
+    /// advance past UIDs that were never indexed.
     pub async fn uid_batch_retrieve_emails(
         session: &mut Session<Box<dyn SessionStream>>,
         account_id: u64,
@@ -460,7 +476,7 @@ impl ImapExecutor {
         uid_set: &str,
         max_email_size_bytes: Option<u64>,
         token: CancellationToken,
-    ) -> BichonResult<u64> {
+    ) -> BichonResult<(u64, Option<u32>)> {
         let limit = max_email_size_bytes.unwrap_or(DEFAULT_MAX_EMAIL_SIZE);
 
         // PASS 1: fetch only SIZE to identify oversized messages
@@ -495,7 +511,7 @@ impl ImapExecutor {
         };
 
         if acceptable_uids.is_empty() {
-            return Ok(0);
+            return Ok((0, None));
         }
 
         // PASS 2: fetch bodies only for acceptable UIDs
@@ -506,6 +522,7 @@ impl ImapExecutor {
             .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
 
         let mut count = 0u64;
+        let mut max_uid: Option<u32> = None;
         while let Some(fetch) = body_stream
             .try_next()
             .await
@@ -518,10 +535,14 @@ impl ImapExecutor {
                     ErrorCode::InternalError
                 ));
             }
+            // Track the highest UID among emails that are actually indexed.
+            if let Some(uid) = fetch.uid {
+                max_uid = Some(max_uid.unwrap_or(0).max(uid));
+            }
             extract_envelope_and_store_it(fetch, account_id, mailbox_id).await?;
             count += 1;
         }
-        Ok(count)
+        Ok((count, max_uid))
     }
 
     /// Fetches the raw RFC822 body of a single message by UID.
