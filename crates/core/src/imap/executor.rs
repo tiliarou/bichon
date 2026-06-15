@@ -535,12 +535,14 @@ impl ImapExecutor {
                     ErrorCode::InternalError
                 ));
             }
-            // Track the highest UID among emails that are actually indexed.
-            if let Some(uid) = fetch.uid {
-                max_uid = Some(max_uid.unwrap_or(0).max(uid));
-            }
+            // Capture uid BEFORE moving fetch into the store call.
+            let uid = fetch.uid;
             extract_envelope_and_store_it(fetch, account_id, mailbox_id).await?;
             count += 1;
+            // Update max_uid ONLY after successful indexing.
+            if let Some(uid) = uid {
+                max_uid = Some(max_uid.unwrap_or(0).max(uid));
+            }
         }
         Ok((count, max_uid))
     }
