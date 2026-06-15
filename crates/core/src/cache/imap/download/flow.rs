@@ -49,23 +49,6 @@ pub enum FetchDirection {
     Before,
 }
 
-/// Extracts the maximum UID from an IMAP sequence set string.
-/// Handles all RFC 3501 sequence set formats:
-/// - Single UID:     "42"       -> 42
-/// - Range:          "1:5"      -> 5
-/// - Mixed list:     "1,3,5:10" -> 10
-/// - Unordered:      "5:10,1:3" -> 10
-fn extract_max_uid_from_sequence(sequence: &str) -> Option<u32> {
-    sequence
-        .split(',')
-        .filter_map(|part| {
-            part.split(':')
-                .filter_map(|s| s.trim().parse::<u32>().ok())
-                .max()
-        })
-        .max()
-}
-
 /// Generates a synthetic UIDVALIDITY for IMAP servers that don't provide one.
 ///
 /// Uses the first 4 bytes of a Blake3 hash of the mailbox name, with bit 31
