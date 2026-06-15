@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -582,7 +581,13 @@ pub async fn reconcile_mailboxes(
             };
 
             let mut updated = remote_mailbox.clone();
-            updated.highest_uid = new_highest_uid;
+            // Never overwrite a known highest_uid with None.
+            // Priority: value from this sync run → pre-existing local checkpoint → remote fallback.
+            // This prevents the final batch_upsert from erasing the checkpoint that was
+            // correctly persisted during intra-batch updates when no new mail is found.
+            updated.highest_uid = new_highest_uid
+                .or(local_mailbox.highest_uid)
+                .or(remote_mailbox.highest_uid);
             // Update uid_validity with the resolved value (either from server or synthetic)
             if updated.uid_validity.is_none() {
                 updated.uid_validity = Some(remote_uid_validity);
