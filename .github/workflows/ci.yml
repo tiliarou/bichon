@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: bichon-server
+  BINARY_CLI: bichon-cli
+  BINARY_ADMIN: bichon-admin
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build-and-test:
+    name: Build & Test (x86_64-linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: x86_64-unknown-linux-gnu
+          override: true
+
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Build frontend (web)
+        working-directory: ./web
+        run: |
+          pnpm install
+          pnpm dlx update-browserslist-db@latest
+          pnpm run build
+
+      - name: Create test root dir
+        run: mkdir -p /tmp/bichon-test
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Run tests (core crate)
+        # Skip tests that require local EML fixtures, live IMAP credentials,
+        # or a real on-disk Tantivy index — none of which are available in CI.
+        run: |
+          cargo test -p bichon-core --release --target ${{ env.TARGET }} -- \
+            --skip imap_tests::test1 \
+            --skip imap_tests::test667 \
+            --skip imap_tests::test_bulk_attachment_stripping_blake3 \
+            --skip imap_tests::testxx \
+            --skip migrate_tests::test_real_tantivy_dir
+        env:
+          BICHON_ROOT_DIR: /tmp/bichon-test
+          BICHON_ENCRYPT_PASSWORD: test-password-ci
+
+      - name: Strip binaries
+        if: always() && hashFiles(format('target/{0}/release/{1}', env.TARGET, env.BINARY_NAME)) != ''
+        run: |
+          strip target/${{ env.TARGET }}/release/${{ env.BINARY_NAME }}
+          strip target/${{ env.TARGET }}/release/${{ env.BINARY_CLI }}
+          strip target/${{ env.TARGET }}/release/${{ env.BINARY_ADMIN }}
+
+      - name: Package binaries
+        if: always() && hashFiles(format('target/{0}/release/{1}', env.TARGET, env.BINARY_NAME)) != ''
+        run: |
+          mkdir -p release
+          cp target/${{ env.TARGET }}/release/${{ env.BINARY_NAME }} release/
+          cp target/${{ env.TARGET }}/release/${{ env.BINARY_CLI }} release/
+          cp target/${{ env.TARGET }}/release/${{ env.BINARY_ADMIN }} release/
+          cp README.md LICENSE release/
+          tar -czvf bichon-${{ env.TARGET }}.tar.gz -C release .
+
+      - name: Upload binaries artifact
+        if: always() && hashFiles('bichon-*.tar.gz') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bichon-${{ env.TARGET }}
+          path: bichon-${{ env.TARGET }}.tar.gz
+          retention-days: 7
