@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2025 rustmailer.com (https://rustmailer.com)
+// Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
 //
@@ -557,7 +557,7 @@ impl IndexManager {
 
         if start_bound != Bound::Unbounded || end_bound != Bound::Unbounded {
             let q = RangeQuery::new(start_bound, end_bound);
-            subqueries.push((Occur::Must, Box::new(q)));
+            subqueries.push((Occur::Must, Box::new(q))));
         }
 
         let start_bound = if let Some(from) = filter.ingest_since {
@@ -574,7 +574,7 @@ impl IndexManager {
 
         if start_bound != Bound::Unbounded || end_bound != Bound::Unbounded {
             let q = RangeQuery::new(start_bound, end_bound);
-            subqueries.push((Occur::Must, Box::new(q)));
+            subqueries.push((Occur::Must, Box::new(q))));
         }
 
         if let Some(account_ids) = filter.account_ids {
@@ -615,7 +615,7 @@ impl IndexManager {
 
         if start_bound != Bound::Unbounded || end_bound != Bound::Unbounded {
             let q = RangeQuery::new(start_bound, end_bound);
-            subqueries.push((Occur::Must, Box::new(q)));
+            subqueries.push((Occur::Must, Box::new(q))));
         }
 
         if let Some(ref msg_id) = filter.message_id {
@@ -1137,15 +1137,15 @@ impl IndexManager {
 
         let query: Box<dyn Query> = match accounts {
             Some(ref ids) if !ids.is_empty() => {
-                let mut subqueries = Vec::new();
+                let mut subquotes = Vec::new();
                 for &id in ids {
                     let term = Term::from_field_u64(SchemaTools::email_fields().f_account_id, id);
-                    subqueries.push((
+                    subquotes.push((
                         Occur::Should,
                         Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
                     ));
                 }
-                Box::new(BooleanQuery::new(subqueries))
+                Box::new(BooleanQuery::new(subquotes))
             }
             Some(_) => Box::new(EmptyQuery),
             None => Box::new(AllQuery),
@@ -1164,15 +1164,15 @@ impl IndexManager {
 
         let query: Box<dyn Query> = match accounts {
             Some(ref ids) if !ids.is_empty() => {
-                let mut subqueries = Vec::new();
+                let mut subquotes = Vec::new();
                 for &id in ids {
                     let term = Term::from_field_u64(SchemaTools::email_fields().f_account_id, id);
-                    subqueries.push((
+                    subquotes.push((
                         Occur::Should,
                         Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
                     ));
                 }
-                Box::new(BooleanQuery::new(subqueries))
+                Box::new(BooleanQuery::new(subquotes))
             }
             Some(_) => Box::new(EmptyQuery),
             None => Box::new(AllQuery),
@@ -1654,15 +1654,15 @@ impl IndexManager {
 
         let query: Box<dyn Query> = match accounts {
             Some(ref ids) if !ids.is_empty() => {
-                let mut subqueries = Vec::new();
+                let mut subquotes = Vec::new();
                 for &id in ids {
                     let term = Term::from_field_u64(SchemaTools::email_fields().f_account_id, id);
-                    subqueries.push((
+                    subquotes.push((
                         Occur::Should,
                         Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
                     ));
                 }
-                Box::new(BooleanQuery::new(subqueries))
+                Box::new(BooleanQuery::new(subquotes))
             }
             Some(_) => Box::new(EmptyQuery),
             None => Box::new(AllQuery),
