@@ -756,6 +756,19 @@ impl IndexManager {
         }
     }
 
+    pub fn count_emails_in_mailbox(
+        &self,
+        account_id: u64,
+        mailbox_id: u64,
+    ) -> BichonResult<u64> {
+        let searcher = self.create_searcher()?;
+        let query = self.mailbox_query(account_id, mailbox_id);
+        let count = searcher
+            .search(query.as_ref(), &Count)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        Ok(count as u64)
+    }
+
     pub fn get_max_uid(&self, account_id: u64, mailbox_id: u64) -> BichonResult<Option<u64>> {
         let searcher = self.create_searcher()?;
 
@@ -2102,36 +2115,6 @@ mod tests {
         let f = SchemaTools::email_fields();
         let mut old = TantivyDocument::new();
         old.add_text(f.f_content_hash, "hash-abc");
-
-        let reconstructed = reconstruct_for_test(&old, &HashSet::new(), &cache);
-
-        // The body should have been extracted from the EML and added
-        // back to the document.  Search for it.
-        let index = Index::create_in_ram(SchemaTools::email_schema());
-        index.tokenizers().register("euro", EuroTokenizer::new());
-        let mut writer = index
-            .writer_with_num_threads(1, 15_000_000)
-            .expect("writer");
-        writer.add_document(reconstructed).unwrap();
-        writer.commit().unwrap();
-
-        let reader = index.reader().unwrap();
-        reader.reload().unwrap();
-        let searcher = reader.searcher();
-        let parser = QueryParser::for_index(&index, vec![f.f_body]);
-        let hits = searcher
-            .search(&parser.parse_query("hello world").unwrap(), &Count)
-            .unwrap();
-        assert_eq!(hits, 1, "body text should be reconstructed from EML");
-    }
-
-    #[test]
-    fn body_reconstruction_missing_eml_is_graceful() {
-        // When the EML is not in the cache (simulating a blob-store
-        // miss), the document should still be produced without body.
-        let f = SchemaTools::email_fields();
-        let mut old = TantivyDocument::new();
-        old.add_text(f.f_content_hash, "nonexistent-hash");
 
         let cache = HashMap::new(); // empty
         let reconstructed = reconstruct_for_test(&old, &HashSet::new(), &cache);

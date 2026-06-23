@@ -935,6 +935,36 @@ async fn perform_incremental_sync(
                 uid as u64 + 1
             }
             None => {
+                let local_count =
+                    ENVELOPE_MANAGER.count_emails_in_mailbox(account.id, local_mailbox.id)?;
+                tracing::info!(
+                    "[account {}][mailbox {}] perform_incremental_sync: highest_uid unset, local_count={}, remote.exists={}",
+                    account.id,
+                    local_mailbox.name,
+                    local_count,
+                    remote_mailbox.exists,
+                );
+
+                if local_count == 0 {
+                    tracing::info!(
+                        "[account {}][mailbox {}] no local emails, re-running full mailbox fetch",
+                        account.id,
+                        local_mailbox.name,
+                    );
+                    return fetch_and_save_full_mailbox(account, remote_mailbox, token).await;
+                }
+
+                if local_count < remote_mailbox.exists as u64 {
+                    tracing::warn!(
+                        "[account {}][mailbox {}] local_count({}) < remote.exists({}), treating as interrupted initial sync; re-running full mailbox fetch",
+                        account.id,
+                        local_mailbox.name,
+                        local_count,
+                        remote_mailbox.exists,
+                    );
+                    return fetch_and_save_full_mailbox(account, remote_mailbox, token).await;
+                }
+
                 let local_max_uid =
                     ENVELOPE_MANAGER.get_max_uid(account.id, local_mailbox.id)?;
                 tracing::info!(
@@ -948,40 +978,10 @@ async fn perform_incremental_sync(
                     Some(uid) => uid + 1,
                     None => {
                         info!(
-                            "No maximum UID found in index for mailbox, assuming local storage is missing."
+                            "No maximum UID found in index for mailbox, re-running full mailbox fetch."
                         );
 
-                        let result = match &account.date_since {
-                            Some(date_since) => {
-                                fetch_and_save_by_date(
-                                    account,
-                                    date_since.since_date()?.as_str(),
-                                    remote_mailbox,
-                                    FetchDirection::Since,
-                                    token,
-                                )
-                                .await?
-                            }
-                            None => match &account.date_before {
-                                Some(r) => {
-                                    fetch_and_save_by_date(
-                                        account,
-                                        &r.calculate_date()?,
-                                        remote_mailbox,
-                                        FetchDirection::Before,
-                                        token,
-                                    )
-                                    .await?
-                                }
-                                None => {
-                                    fetch_and_save_full_mailbox(
-                                        account, remote_mailbox, token,
-                                    )
-                                    .await?
-                                }
-                            },
-                        };
-                        return Ok(result);
+                        return fetch_and_save_full_mailbox(account, remote_mailbox, token).await;
                     }
                 }
             }
