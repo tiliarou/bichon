@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -569,9 +568,11 @@ async fn reconcile_uid_validity_change(
 
     let max_uid = remote_uid_list.last().copied();
 
-    // Phase 3: fetch remote Message-IDs (headers only, no bodies)
-    let uid_set =
-        ImapExecutor::fetch_uid_metadata(&mut session, &uid_set, token.clone()).await?;
+    // Phase 3: fetch remote Message-IDs (headers only, no bodies).
+    // Build a compressed UID range string from the full remote UID list.
+    let uid_set_str = compress_uid_list(remote_uid_list.clone());
+    let remote_msg_ids =
+        ImapExecutor::fetch_uid_metadata(&mut session, &uid_set_str, token.clone()).await?;
     session.logout().await.ok();
 
     // Phase 4: query local Message-IDs from Tantivy.
