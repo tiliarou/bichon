@@ -6,16 +6,13 @@ use crate::store::tantivy::envelope::ENVELOPE_MANAGER;
 use crate::store::tantivy::fields::{F_ACCOUNT_ID, F_CONTENT_HASH, F_INGEST_AT, F_MAILBOX_ID};
 use crate::utc_now;
 
-/// Max entries before evicting the oldest.
+/// Max entries before truncating to the newest subset on populate.
 /// At ~152 bytes/entry, 300_000 ≈ 45 MB, within the 50 MB budget.
 const MAX_ENTRIES: usize = 300_000;
 
 /// Fraction of entries to keep when evicting (newest 3/4).
 const KEEP_FRACTION_NUM: usize = 3;
 const KEEP_FRACTION_DEN: usize = 4;
-
-/// Populate only loads entries ingested within this window.
-const POPULATE_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 pub static DEDUP_CACHE: LazyLock<DedupCache> = LazyLock::new(DedupCache::new);
 
@@ -56,9 +53,10 @@ impl DedupCache {
     /// has already been seen.
     ///
     /// On the very first call the cache is populated from the Tantivy index
-    /// FAST columns (only entries ingested within [`POPULATE_WINDOW_MS`]).
-    /// If that scan fails the cache starts empty and still operates correctly
-    /// for newly-arriving emails.
+    /// FAST columns (all entries, no time cutoff). If the total number of
+    /// indexed entries exceeds [`MAX_ENTRIES`], only the newest ones are kept
+    /// so memory stays within budget. If the scan fails the cache starts empty
+    /// and still operates correctly for newly-arriving emails.
     pub fn contains(&self, account_id: u64, mailbox_id: u64, hash: &str) -> bool {
         self.ensure_populated();
 
@@ -119,8 +117,10 @@ impl DedupCache {
         };
 
         let searcher = reader.searcher();
-        let cutoff = utc_now!() - POPULATE_WINDOW_MS;
-        let mut entries = self.entries.lock().unwrap();
+
+        // Collect ALL entries from the index — no time cutoff.
+        // This prevents re-ingesting old emails as duplicates after a restart.
+        let mut all_entries: Vec<((u64, u64, String), i64)> = Vec::new();
 
         for segment_reader in searcher.segment_readers() {
             let account_col = match segment_reader.fast_fields().u64(F_ACCOUNT_ID) {
@@ -146,9 +146,6 @@ impl DedupCache {
                     continue;
                 }
                 let ingest_at = ingest_col.values.get_val(doc_id);
-                if ingest_at < cutoff {
-                    continue;
-                }
                 let account_id = account_col.values.get_val(doc_id);
                 let mailbox_id = mailbox_col.values.get_val(doc_id);
 
@@ -162,14 +159,40 @@ impl DedupCache {
                     continue;
                 }
 
-                entries.insert((account_id, mailbox_id, hash_buf), ingest_at);
+                all_entries.push(((account_id, mailbox_id, hash_buf), ingest_at));
             }
         }
 
+        let total = all_entries.len();
+
+        // If the index holds more entries than our memory budget allows, keep
+        // only the newest ones. This means very old emails beyond the budget
+        // could theoretically be re-ingested, but that is an edge case for
+        // mailboxes with hundreds of thousands of messages.
+        if total > self.max_entries {
+            tracing::warn!(
+                "DedupCache: index has {} entries, exceeds MAX_ENTRIES {}. \
+                 Keeping newest {} to stay within memory budget. \
+                 Emails older than the cutoff may be re-checked against the index on next sync.",
+                total,
+                self.max_entries,
+                self.max_entries
+            );
+            // Sort descending by ingest_at (newest first), then truncate.
+            all_entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            all_entries.truncate(self.max_entries);
+        }
+
+        let loaded = all_entries.len();
+        let mut entries = self.entries.lock().unwrap();
+        for (key, ts) in all_entries {
+            entries.insert(key, ts);
+        }
+
         tracing::info!(
-            "DedupCache populated with {} entries from index (cutoff {}d ago)",
-            entries.len(),
-            POPULATE_WINDOW_MS / (24 * 60 * 60 * 1000),
+            "DedupCache populated with {}/{} entries from index (no time cutoff)",
+            loaded,
+            total,
         );
     }
 
@@ -405,7 +428,6 @@ mod tests {
         let cache = DedupCache::new_for_test();
         {
             let searcher = reader.searcher();
-            let cutoff = utc_now!() - POPULATE_WINDOW_MS;
             let mut entries = cache.entries.lock().unwrap();
             entries.clear();
 
@@ -425,9 +447,6 @@ mod tests {
                         continue;
                     }
                     let ingest_at = ingest_col.values.get_val(doc_id);
-                    if ingest_at < cutoff {
-                        continue;
-                    }
                     let account_id = account_col.values.get_val(doc_id);
                     let mailbox_id = mailbox_col.values.get_val(doc_id);
 
@@ -450,13 +469,16 @@ mod tests {
         assert!(cache.contains(1, 20, "hash-recent"));
     }
 
+    /// Old entries (beyond the former 7-day window) must now be included.
+    /// This is the regression test for the duplicate-on-restart bug.
     #[test]
-    fn populate_skips_old_entries() {
+    fn populate_includes_old_entries() {
         let (index, fields) = build_test_index();
         let mut writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
 
         let recent = utc_now!();
-        let old = recent - POPULATE_WINDOW_MS - 60_000; // 1 minute past the window
+        // Simulate an email ingested 30 days ago — well beyond the old 7-day window.
+        let old = recent - 30 * 24 * 60 * 60 * 1000;
         add_email_doc(&fields, &mut writer, 1, 10, "hash-recent", recent);
         add_email_doc(&fields, &mut writer, 1, 10, "hash-old", old);
         writer.commit().unwrap();
@@ -466,7 +488,6 @@ mod tests {
         let cache = DedupCache::new_for_test();
         {
             let searcher = reader.searcher();
-            let cutoff = utc_now!() - POPULATE_WINDOW_MS;
             let mut entries = cache.entries.lock().unwrap();
             entries.clear();
 
@@ -486,9 +507,6 @@ mod tests {
                         continue;
                     }
                     let ingest_at = ingest_col.values.get_val(doc_id);
-                    if ingest_at < cutoff {
-                        continue;
-                    }
                     let account_id = account_col.values.get_val(doc_id);
                     let mailbox_id = mailbox_col.values.get_val(doc_id);
 
@@ -505,9 +523,10 @@ mod tests {
             }
         }
 
+        // Both recent AND old entries must be present — no time cutoff.
         assert!(cache.contains(1, 10, "hash-recent"));
-        assert!(!cache.contains(1, 10, "hash-old"));
-        assert_eq!(cache.entries.lock().unwrap().len(), 1);
+        assert!(cache.contains(1, 10, "hash-old"), "old entry must be in cache after populate");
+        assert_eq!(cache.entries.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -529,7 +548,6 @@ mod tests {
         let cache = DedupCache::new_for_test();
         {
             let searcher = reader.searcher();
-            let cutoff = utc_now!() - POPULATE_WINDOW_MS;
             let mut entries = cache.entries.lock().unwrap();
             entries.clear();
 
@@ -549,9 +567,6 @@ mod tests {
                         continue;
                     }
                     let ingest_at = ingest_col.values.get_val(doc_id);
-                    if ingest_at < cutoff {
-                        continue;
-                    }
                     let account_id = account_col.values.get_val(doc_id);
                     let mailbox_id = mailbox_col.values.get_val(doc_id);
 

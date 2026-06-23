@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -44,11 +43,25 @@ use tracing::{debug, error, info, warn};
 
 const MAX_NETWORK_RETRIES: u32 = 3;
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FetchDirection {
     Since,
     Before,
+}
+
+/// Generates a synthetic UIDVALIDITY for IMAP servers that don't provide one.
+///
+/// Uses the first 4 bytes of a Blake3 hash of the mailbox name, with bit 31
+/// forced to 1 to avoid 0 (which is reserved by RFC 3501).
+///
+/// Blake3 is deterministic and stable across Rust compiler versions and
+/// platforms, unlike `std::collections::hash_map::DefaultHasher`.
+fn generate_synthetic_uidvalidity(mailbox_name: &str) -> u32 {
+    let hash = blake3::hash(mailbox_name.as_bytes());
+    let bytes = hash.as_bytes();
+    let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // Set bit 31 to guarantee the value is >= 2^31 and never 0.
+    value | 0x8000_0000
 }
 
 pub async fn fetch_and_save_by_date(
@@ -118,7 +131,6 @@ pub async fn fetch_and_save_by_date(
     let mut uid_vec: Vec<u32> = uid_list.into_iter().collect();
     uid_vec.sort();
 
-    let max_uid = uid_vec.last().copied();
     let planned = uid_vec.len() as u64;
     let uid_batches = generate_uid_sequence_hashset(
         uid_vec,
@@ -135,6 +147,8 @@ pub async fn fetch_and_save_by_date(
 
     let mut current_processed = 0u64;
     let mut has_error_or_cancel = false;
+    // Tracks the highest UID actually indexed across all batches.
+    let mut overall_max_uid: Option<u32> = None;
     for (index, batch) in uid_batches.into_iter().enumerate() {
         if token.is_cancelled() {
             DownloadState::update_session_status(
@@ -166,7 +180,7 @@ pub async fn fetch_and_save_by_date(
             )
             .await
             {
-                Ok(processed) => break Ok(processed),
+                Ok(result) => break Ok(result),
                 Err(e)
                     if retries < MAX_NETWORK_RETRIES && e.code() == ErrorCode::NetworkError =>
                 {
@@ -211,8 +225,21 @@ pub async fn fetch_and_save_by_date(
             }
         };
         match batch_result {
-            Ok(processed) => {
+            Ok((processed, batch_max_uid)) => {
                 current_processed += processed;
+
+                // Persist highest_uid after each successful batch using the UID
+                // of the last email *actually indexed*, not the max UID of the
+                // request sequence. This prevents silently skipping oversized
+                // emails: if UIDs 60-79 were all skipped due to size, we do not
+                // advance the cursor to 79.
+                if let Some(uid) = batch_max_uid {
+                    overall_max_uid = Some(overall_max_uid.unwrap_or(0).max(uid));
+                    let mut updated = mailbox.clone();
+                    updated.highest_uid = overall_max_uid;
+                    MailBox::batch_upsert(&[updated])?;
+                }
+
                 DownloadState::update_folder_progress(
                     account_id,
                     mailbox.name.clone(),
@@ -242,14 +269,14 @@ pub async fn fetch_and_save_by_date(
         DownloadState::update_folder_progress(
             account_id,
             mailbox.name.clone(),
-            planned,
+            current_processed,
             current_processed,
             FolderStatus::Success,
             None,
         )?;
     }
     session.logout().await.ok();
-    Ok(max_uid)
+    Ok(overall_max_uid)
 }
 
 /// Fetches all messages from a mailbox.
@@ -388,6 +415,15 @@ pub async fn fetch_and_save_full_mailbox(
         match batch_result {
             Ok(count) => {
                 current_processed += count as u64;
+
+                // Persist highest_uid after each successful batch, so a crash between
+                // pages still records the last seen UID.
+                if let Some(uid) = max_uid {
+                    let mut updated = mailbox.clone();
+                    updated.highest_uid = Some(uid);
+                    MailBox::batch_upsert(&[updated])?;
+                }
+
                 DownloadState::update_folder_progress(
                     account_id,
                     mailbox.name.clone(),
@@ -804,11 +840,20 @@ pub async fn reconcile_mailboxes(
             };
 
             let mut updated = remote_mailbox.clone();
-            updated.highest_uid = new_highest_uid;
-            // Update uid_validity with the resolved value (either from server or synthetic)
-            if updated.uid_validity.is_none() {
-                updated.uid_validity = Some(remote_uid_validity);
-            }
+            // Never overwrite a known highest_uid with None.
+            // Priority: value from this sync run → pre-existing local checkpoint.
+            // The remote_mailbox object comes from the IMAP LIST response and must
+            // never be used as a source of truth for highest_uid — only the local DB
+            // checkpoint and the value produced by the current sync run are authoritative.
+            // Using remote_mailbox.highest_uid here would silently restore a stale server
+            // value (e.g. 884234) over a deliberately reset local checkpoint (e.g. 1).
+            updated.highest_uid = new_highest_uid.or(local_mailbox.highest_uid);
+            // Always write the resolved uid_validity (real or synthetic) so that the
+            // stored value is consistent with the comparison made above. Previously
+            // this was conditional on .is_none(), which could leave a stale None in
+            // place if the server flip-flops between providing and not providing
+            // UIDVALIDITY, causing spurious full rebuilds on the next run.
+            updated.uid_validity = Some(remote_uid_validity);
             mailboxes_to_update.push(updated);
         }
         //The metadata of this mailbox must only be updated after a successful synchronization;

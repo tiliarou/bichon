@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -295,7 +294,17 @@ fn extract_base_domain(host: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Smoke-test: probe 25 real mail providers via live network.
+    ///
+    /// Marked `#[ignore]` because it requires outbound internet access and
+    /// makes up to 9 sequential HTTP/DNS requests per domain (10 s timeout
+    /// each), which easily exceeds the default 60 s test-runner threshold
+    /// and causes spurious failures in sandboxed CI environments.
+    ///
+    /// Run manually when network access is available:
+    ///   cargo test -- --ignored test_fetch_valid_domain
     #[tokio::test]
+    #[ignore]
     async fn test_fetch_valid_domain() {
         let domains = vec![
             // North America

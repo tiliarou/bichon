@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -49,6 +48,23 @@ fn classify_imap_error(e: &async_imap::error::Error) -> ErrorCode {
         async_imap::error::Error::ConnectionLost => ErrorCode::NetworkError,
         _ => ErrorCode::ImapCommandFailed,
     }
+}
+
+/// Extracts the maximum UID from an IMAP sequence set string.
+/// Handles all RFC 3501 sequence set formats:
+/// - Single UID:     "42"       -> 42
+/// - Range:          "1:5"      -> 5
+/// - Mixed list:     "1,3,5:10" -> 10
+/// - Unordered:      "5:10,1:3" -> 10
+fn extract_max_uid_from_sequence(sequence: &str) -> Option<u32> {
+    sequence
+        .split(',')
+        .filter_map(|part| {
+            part.split(':')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .max()
+        })
+        .max()
 }
 
 pub struct ImapExecutor;
@@ -133,6 +149,11 @@ impl ImapExecutor {
     /// Two-step approach for date-filtered incremental fetch: UID SEARCH first,
     /// then batch UID FETCH for matching UIDs. Uses standard IMAP syntax that
     /// works across all compliant servers.
+    ///
+    /// `highest_uid` is persisted to the mailbox row after each successful batch
+    /// so that an interruption mid-way can resume from the last completed batch
+    /// on the next run, matching the behaviour of `fetch_and_save_by_date` and
+    /// `fetch_and_save_full_mailbox`.
     async fn fetch_new_mail_with_before(
         session: &mut Session<Box<dyn SessionStream>>,
         account: &AccountModel,
@@ -166,7 +187,6 @@ impl ImapExecutor {
 
         let mut uid_vec: Vec<u32> = results.into_iter().collect();
         uid_vec.sort();
-        let max_uid = uid_vec.last().copied();
         let planned = uid_vec.len() as u64;
         let batch_size = account.download_batch_size.unwrap_or(DEFAULT_BATCH_SIZE) as usize;
         let uid_batches = generate_uid_sequence_hashset(uid_vec, batch_size);
@@ -181,6 +201,8 @@ impl ImapExecutor {
         )?;
 
         let mut count = 0u64;
+        // Tracks the highest UID actually indexed across all batches.
+        let mut overall_max_uid: Option<u32> = None;
         for batch in uid_batches {
             if token.is_cancelled() {
                 DownloadState::update_session_status(
@@ -201,7 +223,7 @@ impl ImapExecutor {
                     ErrorCode::InternalError
                 ));
             }
-            let processed = Self::uid_batch_retrieve_emails(
+            let (processed, batch_max_uid) = Self::uid_batch_retrieve_emails(
                 session,
                 account.id,
                 mailbox.id,
@@ -211,6 +233,19 @@ impl ImapExecutor {
             )
             .await?;
             count += processed;
+
+            // Persist highest_uid after each successful batch using the UID of
+            // the last email that was *actually indexed*, not the max UID of the
+            // request sequence. This prevents silently skipping oversized emails:
+            // if UIDs 60-79 were all skipped due to size, we do not advance the
+            // cursor to 79 — the next run will attempt them again.
+            if let Some(uid) = batch_max_uid {
+                overall_max_uid = Some(overall_max_uid.unwrap_or(0).max(uid));
+                let mut updated = mailbox.clone();
+                updated.highest_uid = overall_max_uid;
+                MailBox::batch_upsert(&[updated])?;
+            }
+
             DownloadState::update_folder_progress(
                 account.id,
                 mailbox.name.clone(),
@@ -230,7 +265,7 @@ impl ImapExecutor {
             None,
         )?;
 
-        Ok(max_uid)
+        Ok(overall_max_uid)
     }
 
     /// Direct ranged UID FETCH without date filtering. Streams results from
@@ -295,6 +330,7 @@ impl ImapExecutor {
                 continue;
             }
 
+            // Update max_uid only for emails that will actually be indexed.
             if let Some(uid) = fetch.uid {
                 max_uid = Some(max_uid.unwrap_or(0).max(uid));
             }
@@ -424,6 +460,17 @@ impl ImapExecutor {
         Ok(count)
     }
 
+    /// Fetches a batch of emails identified by a UID sequence set string.
+    ///
+    /// Uses a two-pass strategy:
+    /// 1. Fetch SIZE only to filter oversized messages.
+    /// 2. Fetch full bodies only for acceptable UIDs.
+    ///
+    /// Returns `(count, max_uid_indexed)` where `count` is the number of emails
+    /// successfully indexed and `max_uid_indexed` is the highest UID among those
+    /// emails — **not** the highest UID in the request sequence. This distinction
+    /// matters when emails are skipped due to the size limit: the cursor must not
+    /// advance past UIDs that were never indexed.
     pub async fn uid_batch_retrieve_emails(
         session: &mut Session<Box<dyn SessionStream>>,
         account_id: u64,
@@ -431,7 +478,7 @@ impl ImapExecutor {
         uid_set: &str,
         max_email_size_bytes: Option<u64>,
         token: CancellationToken,
-    ) -> BichonResult<u64> {
+    ) -> BichonResult<(u64, Option<u32>)> {
         let limit = max_email_size_bytes.unwrap_or(DEFAULT_MAX_EMAIL_SIZE);
 
         // PASS 1: fetch only SIZE to identify oversized messages
@@ -466,7 +513,7 @@ impl ImapExecutor {
         };
 
         if acceptable_uids.is_empty() {
-            return Ok(0);
+            return Ok((0, None));
         }
 
         // PASS 2: fetch bodies only for acceptable UIDs
@@ -477,6 +524,7 @@ impl ImapExecutor {
             .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
 
         let mut count = 0u64;
+        let mut max_uid: Option<u32> = None;
         while let Some(fetch) = body_stream
             .try_next()
             .await
@@ -489,10 +537,16 @@ impl ImapExecutor {
                     ErrorCode::InternalError
                 ));
             }
+            // Capture uid BEFORE moving fetch into the store call.
+            let uid = fetch.uid;
             extract_envelope_and_store_it(fetch, account_id, mailbox_id).await?;
             count += 1;
+            // Update max_uid ONLY after successful indexing.
+            if let Some(uid) = uid {
+                max_uid = Some(max_uid.unwrap_or(0).max(uid));
+            }
         }
-        Ok(count)
+        Ok((count, max_uid))
     }
 
     /// Fetches the raw RFC822 body of a single message by UID.
@@ -535,14 +589,6 @@ impl ImapExecutor {
                 )
             })?
             .to_vec();
-
-        // // Drain any remaining items so the stream is fully consumed before reuse.
-        // while stream
-        //     .try_next()
-        //     .await
-        //     .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?
-        //     .is_some()
-        // {}
 
         Ok(body)
     }
