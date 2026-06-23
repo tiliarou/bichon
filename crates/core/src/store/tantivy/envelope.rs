@@ -756,6 +756,11 @@ impl IndexManager {
         }
     }
 
+    /// Returns the number of emails indexed in Tantivy for a given mailbox.
+    ///
+    /// Used during incremental sync to detect an interrupted initial sync:
+    /// if `local_count < remote.exists` and `highest_uid` is `None`, the
+    /// mailbox was only partially downloaded and needs a full re-fetch.
     pub fn count_emails_in_mailbox(
         &self,
         account_id: u64,
