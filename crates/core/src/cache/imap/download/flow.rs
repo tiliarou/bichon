@@ -570,8 +570,7 @@ async fn reconcile_uid_validity_change(
     let max_uid = remote_uid_list.last().copied();
 
     // Phase 3: fetch remote Message-IDs (headers only, no bodies)
-    let uid_set = compress_uid_list(remote_uid_list.clone());
-    let remote_msg_ids =
+    let uid_set =
         ImapExecutor::fetch_uid_metadata(&mut session, &uid_set, token.clone()).await?;
     session.logout().await.ok();
 
