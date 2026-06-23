@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
+// Copyright (c) 2025 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
 //
@@ -756,11 +756,6 @@ impl IndexManager {
         }
     }
 
-    /// Returns the number of emails indexed in Tantivy for a given mailbox.
-    ///
-    /// Used during incremental sync to detect an interrupted initial sync:
-    /// if `local_count < remote.exists` and `highest_uid` is `None`, the
-    /// mailbox was only partially downloaded and needs a full re-fetch.
     pub fn count_emails_in_mailbox(
         &self,
         account_id: u64,
@@ -1142,15 +1137,15 @@ impl IndexManager {
 
         let query: Box<dyn Query> = match accounts {
             Some(ref ids) if !ids.is_empty() => {
-                let mut subquotes = Vec::new();
+                let mut subqueries = Vec::new();
                 for &id in ids {
                     let term = Term::from_field_u64(SchemaTools::email_fields().f_account_id, id);
-                    subquotes.push((
+                    subqueries.push((
                         Occur::Should,
                         Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
                     ));
                 }
-                Box::new(BooleanQuery::new(subquotes))
+                Box::new(BooleanQuery::new(subqueries))
             }
             Some(_) => Box::new(EmptyQuery),
             None => Box::new(AllQuery),
@@ -1169,15 +1164,15 @@ impl IndexManager {
 
         let query: Box<dyn Query> = match accounts {
             Some(ref ids) if !ids.is_empty() => {
-                let mut subquotes = Vec::new();
+                let mut subqueries = Vec::new();
                 for &id in ids {
                     let term = Term::from_field_u64(SchemaTools::email_fields().f_account_id, id);
-                    subquotes.push((
+                    subqueries.push((
                         Occur::Should,
                         Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
                     ));
                 }
-                Box::new(BooleanQuery::new(subquotes))
+                Box::new(BooleanQuery::new(subqueries))
             }
             Some(_) => Box::new(EmptyQuery),
             None => Box::new(AllQuery),
@@ -1203,56 +1198,180 @@ impl IndexManager {
 
     pub async fn update_envelope_tags(&self, request: TagsRequest) -> BichonResult<()> {
         if request.updates.is_empty() {
+            tracing::warn!("update_envelope_tags: request is empty, nothing to update");
             return Ok(());
         }
-
-        let mut writer = self.index_writer.lock().await;
         let searcher = self.create_searcher()?;
+        let mut writer = self.index_writer.lock().await;
+
         let f = SchemaTools::email_fields();
+        let f_tags = f.f_tags;
+        let f_id = f.f_id;
+        let deduplicated_updates: HashMap<u64, HashSet<String>> = request
+            .updates
+            .into_iter()
+            .map(|(account_id, envelope_ids)| (account_id, envelope_ids.into_iter().collect()))
+            .collect();
 
-        for update in request.updates {
-            let query = self.envelope_query(update.account_id, &update.envelope_id);
+        let mut operations = Vec::new();
 
-            let docs: Vec<DocAddress> = searcher
-                .search(&query, &DocSetCollector)
-                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?
-                .into_iter()
-                .collect();
-
-            for doc_address in docs {
-                let existing_doc: TantivyDocument = searcher
-                    .doc(doc_address)
+        for (account_id, envelope_ids) in &deduplicated_updates {
+            for eid in envelope_ids {
+                let query = self.envelope_query(*account_id, eid);
+                let docs = searcher
+                    .search(query.as_ref(), &TopDocs::with_limit(1).order_by_score())
                     .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
 
-                let mut envelope = EnvelopeWithAttachments::from_tantivy_doc(&existing_doc)?;
+                if let Some((_, doc_address)) = docs.first() {
+                    let old_doc: TantivyDocument = searcher
+                        .doc(*doc_address)
+                        .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
 
-                match update.action {
-                    TagAction::Add => {
-                        for tag in &update.tags {
-                            if !envelope.tags.contains(tag) {
-                                envelope.tags.push(tag.clone());
+                    let mut current_tags: HashSet<String> = old_doc
+                        .get_all(f_tags)
+                        .filter_map(|val| val.as_facet())
+                        .map(|facet| facet.to_string())
+                        .collect();
+
+                    match request.action {
+                        TagAction::Add => {
+                            for tag in &request.tags {
+                                current_tags.insert(tag.clone());
+                            }
+                        }
+                        TagAction::Remove => {
+                            for tag in &request.tags {
+                                current_tags.remove(tag);
+                            }
+                        }
+                        TagAction::Overwrite => {
+                            current_tags = request.tags.iter().cloned().collect();
+                        }
+                    }
+
+                    let mut new_doc = TantivyDocument::new();
+
+                    // Copy stored fields, excluding f_tags (handled separately).
+                    for (field, value) in old_doc.field_values() {
+                        if field != f_tags {
+                            new_doc.add_field_value(field, value);
+                        }
+                    }
+
+                    // Reconstruct non-stored text-search fields from their
+                    // stored counterparts. f_from_text / f_to_text / f_cc_text /
+                    // f_bcc_text carry the same content as f_from / f_to / f_cc / f_bcc.
+                    for val in old_doc.get_all(f.f_from) {
+                        if let Some(s) = val.as_str() {
+                            new_doc.add_text(f.f_from_text, s);
+                        }
+                    }
+                    for val in old_doc.get_all(f.f_to) {
+                        if let Some(s) = val.as_str() {
+                            new_doc.add_text(f.f_to_text, s);
+                        }
+                    }
+                    for val in old_doc.get_all(f.f_cc) {
+                        if let Some(s) = val.as_str() {
+                            new_doc.add_text(f.f_cc_text, s);
+                        }
+                    }
+                    for val in old_doc.get_all(f.f_bcc) {
+                        if let Some(s) = val.as_str() {
+                            new_doc.add_text(f.f_bcc_text, s);
+                        }
+                    }
+
+                    // Reconstruct attachment-name fields from the stored
+                    // f_attachments JSON blob.
+                    if let Some(attrs_val) = old_doc.get_first(f.f_attachments) {
+                        if let Some(json_str) = attrs_val.as_str() {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str)
+                            {
+                                if let Some(arr) = parsed.as_array() {
+                                    for att in arr {
+                                        let is_inline = att
+                                            .get("inline")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+                                        let has_cid = att
+                                            .get("content_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| !s.is_empty())
+                                            .unwrap_or(false);
+                                        if is_inline && has_cid {
+                                            continue;
+                                        }
+                                        if let Some(filename) = att
+                                            .get("filename")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                        {
+                                            new_doc.add_text(f.f_attachment_name_text, filename);
+                                            new_doc.add_text(f.f_attachment_name_exact, filename);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    TagAction::Remove => {
-                        envelope.tags.retain(|t| !update.tags.contains(t));
+
+                    // Reconstruct body text from the original EML stored in the
+                    // blob store, referenced by f_content_hash.
+                    if let Some(hash_val) = old_doc.get_first(f.f_content_hash) {
+                        if let Some(content_hash) = hash_val.as_str() {
+                            match BLOB_MANAGER.get_email(content_hash) {
+                                Ok(Some(eml_bytes)) => {
+                                    if let Some(message) = MessageParser::new().parse(&eml_bytes) {
+                                        let text = message
+                                            .body_text(0)
+                                            .map(|cow| cow.into_owned())
+                                            .or_else(|| {
+                                                message
+                                                    .body_html(0)
+                                                    .map(|cow| extract_text(cow.into_owned()))
+                                            })
+                                            .unwrap_or_default();
+                                        let body_text =
+                                            text.split_whitespace().collect::<Vec<_>>().join(" ");
+                                        if !body_text.is_empty() {
+                                            new_doc.add_text(f.f_body, &body_text);
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        content_hash,
+                                        "EML not found in blob store during tag update"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        content_hash,
+                                        error = %e,
+                                        "Failed to fetch EML during tag update"
+                                    );
+                                }
+                            }
+                        }
                     }
-                    TagAction::Set => {
-                        envelope.tags = update.tags.clone();
+
+                    for tag in &current_tags {
+                        new_doc.add_facet(f_tags, tag);
                     }
+
+                    let delete_term = Term::from_field_text(f_id, eid);
+                    operations.push(UserOperation::Delete(delete_term));
+                    operations.push(UserOperation::Add(new_doc));
                 }
-
-                writer
-                    .delete_query(self.envelope_query(update.account_id, &update.envelope_id))
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-
-                let new_doc = envelope.to_tantivy_doc()?;
-                writer
-                    .add_document(new_doc)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
             }
         }
 
+        writer
+            .run(operations)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+
+        // commit
         writer
             .commit()
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
@@ -1264,420 +1383,227 @@ impl IndexManager {
         &self,
         accounts: Option<HashSet<u64>>,
         filter: EmailSearchFilter,
-        page: u32,
-        page_size: u32,
+        page: u64,
+        page_size: u64,
+        desc: bool,
+        sort_by: SortBy,
     ) -> BichonResult<DataPage<Envelope>> {
+        assert!(page > 0, "Page number must be greater than 0");
+        assert!(page_size > 0, "Page size must be greater than 0");
+        let query = self.filter_query(accounts, filter)?;
         let searcher = self.create_searcher()?;
-        let query = self.filter_query(accounts, filter.clone())?;
+        let total = searcher
+            .search(&query, &Count)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?
+            as u64;
 
-        let sort_by = filter.sort_by.unwrap_or(SortBy::Date);
+        if total == 0 {
+            return Ok(DataPage {
+                current_page: Some(page),
+                page_size: Some(page_size),
+                total_items: 0,
+                items: vec![],
+                total_pages: Some(0),
+            });
+        }
+        let offset = (page - 1) * page_size;
+        let total_pages = total.div_ceil(page_size);
+        if offset > total {
+            return Ok(DataPage {
+                current_page: Some(page),
+                page_size: Some(page_size),
+                total_items: total,
+                items: vec![],
+                total_pages: Some(total_pages),
+            });
+        }
 
-        let offset = (page * page_size) as usize;
-        let limit = page_size as usize;
+        let order = if desc { Order::Desc } else { Order::Asc };
+        let mailbox_docs: Vec<DocAddress>;
 
-        let (total, doc_addresses) = match sort_by {
-            SortBy::Date => {
-                let collector = TopDocs::with_limit(limit + offset)
-                    .order_by_fast_field::<i64>(F_DATE, Order::Desc);
-                let top_docs = searcher
-                    .search(&query, &collector)
+        match sort_by {
+            SortBy::DATE => {
+                let date_docs: Vec<(Option<i64>, DocAddress)> = searcher
+                    .search(
+                        &query,
+                        &TopDocs::with_limit(page_size as usize)
+                            .and_offset(offset as usize)
+                            .order_by_fast_field(F_DATE, order),
+                    )
                     .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let total = searcher
-                    .search(&query, &Count)
+                mailbox_docs = date_docs.into_iter().map(|(_, addr)| addr).collect();
+            }
+            SortBy::SIZE => {
+                let size_docs: Vec<(Option<u64>, DocAddress)> = searcher
+                    .search(
+                        &query,
+                        &TopDocs::with_limit(page_size as usize)
+                            .and_offset(offset as usize)
+                            .order_by_fast_field(F_SIZE, order),
+                    )
                     .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let addresses: Vec<DocAddress> = top_docs
-                    .into_iter()
-                    .skip(offset)
-                    .map(|(_, addr)| addr)
-                    .collect();
-                (total, addresses)
+                mailbox_docs = size_docs.into_iter().map(|(_, addr)| addr).collect();
             }
             SortBy::InternalDate => {
-                let collector = TopDocs::with_limit(limit + offset)
-                    .order_by_fast_field::<i64>(F_INTERNAL_DATE, Order::Desc);
-                let top_docs = searcher
-                    .search(&query, &collector)
+                let internal_date_docs: Vec<(Option<i64>, DocAddress)> = searcher
+                    .search(
+                        &query,
+                        &TopDocs::with_limit(page_size as usize)
+                            .and_offset(offset as usize)
+                            .order_by_fast_field(F_INTERNAL_DATE, order),
+                    )
                     .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let total = searcher
-                    .search(&query, &Count)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let addresses: Vec<DocAddress> = top_docs
+                mailbox_docs = internal_date_docs
                     .into_iter()
-                    .skip(offset)
                     .map(|(_, addr)| addr)
                     .collect();
-                (total, addresses)
             }
             SortBy::IngestAt => {
-                let collector = TopDocs::with_limit(limit + offset)
-                    .order_by_fast_field::<i64>(F_INGEST_AT, Order::Desc);
-                let top_docs = searcher
-                    .search(&query, &collector)
+                let ingest_at_docs: Vec<(Option<i64>, DocAddress)> = searcher
+                    .search(
+                        &query,
+                        &TopDocs::with_limit(page_size as usize)
+                            .and_offset(offset as usize)
+                            .order_by_fast_field(F_INGEST_AT, order),
+                    )
                     .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let total = searcher
-                    .search(&query, &Count)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let addresses: Vec<DocAddress> = top_docs
-                    .into_iter()
-                    .skip(offset)
-                    .map(|(_, addr)| addr)
-                    .collect();
-                (total, addresses)
+                mailbox_docs = ingest_at_docs.into_iter().map(|(_, addr)| addr).collect();
             }
-            SortBy::From => {
-                let collector = TopDocs::with_limit(limit + offset)
-                    .order_by_fast_field::<u64>(F_FROM, Order::Asc);
-                let top_docs = searcher
-                    .search(&query, &collector)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let total = searcher
-                    .search(&query, &Count)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let addresses: Vec<DocAddress> = top_docs
-                    .into_iter()
-                    .skip(offset)
-                    .map(|(_, addr)| addr)
-                    .collect();
-                (total, addresses)
-            }
-            SortBy::Size => {
-                let collector = TopDocs::with_limit(limit + offset)
-                    .order_by_fast_field::<u64>(F_SIZE, Order::Desc);
-                let top_docs = searcher
-                    .search(&query, &collector)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let total = searcher
-                    .search(&query, &Count)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let addresses: Vec<DocAddress> = top_docs
-                    .into_iter()
-                    .skip(offset)
-                    .map(|(_, addr)| addr)
-                    .collect();
-                (total, addresses)
-            }
-            SortBy::Relevance => {
-                let collector = TopDocs::with_limit(limit + offset).order_by_score();
-                let top_docs = searcher
-                    .search(&query, &collector)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let total = searcher
-                    .search(&query, &Count)
-                    .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-                let addresses: Vec<DocAddress> = top_docs
-                    .into_iter()
-                    .skip(offset)
-                    .map(|(_, addr)| addr)
-                    .collect();
-                (total, addresses)
-            }
-        };
+        }
 
-        let mut envelopes: Vec<Envelope> = Vec::with_capacity(doc_addresses.len());
-        for doc_address in doc_addresses {
+        let mut result = Vec::new();
+
+        for doc_address in mailbox_docs {
             let doc: TantivyDocument = searcher
                 .doc(doc_address)
                 .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-            let envelope = Envelope::from_tantivy_doc(&doc)?;
-            envelopes.push(envelope);
+            let envelope = EnvelopeWithAttachments::from_tantivy_doc(&doc)?.envelope;
+            result.push(envelope);
         }
-
         Ok(DataPage {
-            data: envelopes,
-            total: total as u64,
-            page,
-            page_size,
+            current_page: Some(page),
+            page_size: Some(page_size),
+            total_items: total,
+            items: result,
+            total_pages: Some(total_pages),
         })
     }
 
-    pub fn get_thread(
-        &self,
-        account_id: u64,
-        thread_id: &str,
-    ) -> BichonResult<Vec<EnvelopeWithAttachments>> {
-        let searcher = self.create_searcher()?;
-        let query = self.thread_query(account_id, thread_id);
-
-        let top_docs = searcher
-            .search(
-                &query,
-                &TopDocs::with_limit(1000).order_by_fast_field::<i64>(F_DATE, Order::Asc),
-            )
-            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-
-        let mut envelopes = Vec::new();
-        for (_, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-            let envelope = EnvelopeWithAttachments::from_tantivy_doc(&doc)?;
-            envelopes.push(envelope);
-        }
-
-        Ok(envelopes)
-    }
-
-    pub fn create_searcher(&self) -> BichonResult<Searcher> {
+    fn create_searcher(&self) -> BichonResult<Searcher> {
         self.reader
             .reload()
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
         Ok(self.reader.searcher())
     }
 
-    pub fn ingest_envelope(
+    pub fn num_messages_in_thread(
         &self,
+        searcher: &Searcher,
         account_id: u64,
-        mailbox_id: u64,
-        uid: u64,
-        envelope: &Envelope,
-        raw_eml: &[u8],
-    ) -> BichonResult<()> {
-        let fields = SchemaTools::email_fields();
-        let mut doc = TantivyDocument::new();
+        thread_id: &str,
+    ) -> BichonResult<u64> {
+        let query = self.thread_query(account_id, thread_id);
 
-        doc.add_u64(fields.f_account_id, account_id);
-        doc.add_u64(fields.f_mailbox_id, mailbox_id);
-        doc.add_u64(fields.f_uid, uid);
-
-        doc.add_text(fields.f_id, &envelope.id);
-        doc.add_text(fields.f_content_hash, &envelope.content_hash);
-        doc.add_text(fields.f_message_id, &envelope.message_id);
-        doc.add_text(fields.f_thread_id, &envelope.thread_id);
-
-        if let Some(date) = envelope.date {
-            doc.add_i64(fields.f_date, date);
-        }
-        if let Some(internal_date) = envelope.internal_date {
-            doc.add_i64(fields.f_internal_date, internal_date);
-        }
-        doc.add_i64(fields.f_ingest_at, utc_now!());
-
-        doc.add_u64(fields.f_size, envelope.size);
-
-        if let Some(ref subject) = envelope.subject {
-            doc.add_text(fields.f_subject, subject);
-        }
-
-        for tag in &envelope.tags {
-            if let Ok(facet) = Facet::from_text(tag) {
-                doc.add_facet(fields.f_tags, facet);
-            }
-        }
-
-        let parsed = MessageParser::default().parse(raw_eml);
-        if let Some(ref msg) = parsed {
-            let body_text = msg
-                .text_bodies()
-                .map(|p| p.text_contents().unwrap_or_default().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let html_text: String = msg
-                .html_bodies()
-                .map(|p| {
-                    let raw = p.text_contents().unwrap_or_default();
-                    extract_text(raw)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let combined = format!("{}\n{}", body_text, html_text);
-            doc.add_text(fields.f_body, &combined);
-
-            let from_contacts = extract_contacts_from_header(msg, "from");
-            let to_contacts = extract_contacts_from_header(msg, "to");
-            let cc_contacts = extract_contacts_from_header(msg, "cc");
-            let bcc_contacts = extract_contacts_from_header(msg, "bcc");
-
-            doc.add_text(fields.f_from_text, &from_contacts.join(" "));
-            doc.add_text(fields.f_to_text, &to_contacts.join(" "));
-            doc.add_text(fields.f_cc_text, &cc_contacts.join(" "));
-            doc.add_text(fields.f_bcc_text, &bcc_contacts.join(" "));
-
-            let from_hash = if let Some(addr) = msg.from().and_then(|f| f.first()) {
-                let normalized = addr
-                    .address()
-                    .map(|a| a.to_lowercase())
-                    .unwrap_or_default();
-                stable_hash_u64(&normalized)
-            } else {
-                0
-            };
-            doc.add_u64(fields.f_from, from_hash);
-
-            let mut attachment_count: u64 = 0;
-            for attachment in msg.attachments() {
-                let content_type = attachment
-                    .content_type()
-                    .map(|ct| format!("{}/{}", ct.c_type, ct.c_subtype.as_deref().unwrap_or("*")))
-                    .unwrap_or_default();
-
-                let filename = attachment
-                    .attachment_name()
-                    .unwrap_or_default()
-                    .to_lowercase();
-
-                let extension = filename
-                    .rfind('.')
-                    .map(|i| &filename[i + 1..])
-                    .unwrap_or_default()
-                    .to_string();
-
-                let category = categorize_attachment(&content_type, &extension);
-
-                let is_inline = attachment
-                    .content_disposition()
-                    .map(|d| d.c_type.eq_ignore_ascii_case("inline"))
-                    .unwrap_or(false);
-
-                if !is_inline {
-                    attachment_count += 1;
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "thread_count": {
+                "value_count": {
+                    "field": F_THREAD_ID
                 }
-
-                doc.add_text(fields.f_attachment_name_exact, &filename);
-                doc.add_text(fields.f_attachment_name_text, &filename);
-                doc.add_text(fields.f_attachment_ext, &extension);
-                doc.add_text(fields.f_attachment_content_type, &content_type);
-                doc.add_text(fields.f_attachment_category, &category);
             }
+        }))
+        .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
 
-            doc.add_u64(fields.f_regular_attachment_count, attachment_count);
-        }
-
-        let writer = self.index_writer.blocking_lock();
-        writer
-            .add_document(doc)
+        let agg_res = searcher
+            .search(query.as_ref(), &collector)
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-
-        Ok(())
+        Self::extract_value_count(&agg_res, "thread_count")
     }
 
-    pub async fn ingest_envelope_async(
+    fn extract_value_count(agg_res: &AggregationResults, name: &str) -> BichonResult<u64> {
+        let Some(result) = agg_res.0.get(name) else {
+            return Err(raise_error!(
+                format!("Missing aggregation result: '{}'", name),
+                ErrorCode::InternalError
+            ));
+        };
+
+        match result {
+            AggregationResult::MetricResult(MetricResult::Count(count)) => {
+                Ok(count.value.map(|v| v as u64).ok_or_else(|| {
+                    raise_error!(
+                        "Failed to get count value from aggregation result: value is None".into(),
+                        ErrorCode::InternalError
+                    )
+                })?)
+            }
+            other => Err(raise_error!(
+                format!("Unexpected aggregation result type: {other:?}"),
+                ErrorCode::InternalError
+            )),
+        }
+    }
+
+    pub fn list_thread_envelopes(
         &self,
         account_id: u64,
-        mailbox_id: u64,
-        uid: u64,
-        envelope: &Envelope,
-        raw_eml: &[u8],
-    ) -> BichonResult<()> {
-        let fields = SchemaTools::email_fields();
-        let mut doc = TantivyDocument::new();
-
-        doc.add_u64(fields.f_account_id, account_id);
-        doc.add_u64(fields.f_mailbox_id, mailbox_id);
-        doc.add_u64(fields.f_uid, uid);
-
-        doc.add_text(fields.f_id, &envelope.id);
-        doc.add_text(fields.f_content_hash, &envelope.content_hash);
-        doc.add_text(fields.f_message_id, &envelope.message_id);
-        doc.add_text(fields.f_thread_id, &envelope.thread_id);
-
-        if let Some(date) = envelope.date {
-            doc.add_i64(fields.f_date, date);
+        thread_id: &str,
+        page: u64,
+        page_size: u64,
+        desc: bool,
+    ) -> BichonResult<DataPage<Envelope>> {
+        assert!(page > 0, "Page number must be greater than 0");
+        assert!(page_size > 0, "Page size must be greater than 0");
+        let searcher = self.create_searcher()?;
+        let total = self.num_messages_in_thread(&searcher, account_id, thread_id)?;
+        if total == 0 {
+            return Ok(DataPage {
+                current_page: Some(page),
+                page_size: Some(page_size),
+                total_items: 0,
+                items: vec![],
+                total_pages: Some(0),
+            });
         }
-        if let Some(internal_date) = envelope.internal_date {
-            doc.add_i64(fields.f_internal_date, internal_date);
-        }
-        doc.add_i64(fields.f_ingest_at, utc_now!());
-
-        doc.add_u64(fields.f_size, envelope.size);
-
-        if let Some(ref subject) = envelope.subject {
-            doc.add_text(fields.f_subject, subject);
-        }
-
-        for tag in &envelope.tags {
-            if let Ok(facet) = Facet::from_text(tag) {
-                doc.add_facet(fields.f_tags, facet);
-            }
+        let offset = (page - 1) * page_size;
+        let total_pages = total.div_ceil(page_size);
+        if offset > total {
+            return Ok(DataPage {
+                current_page: Some(page),
+                page_size: Some(page_size),
+                total_items: total,
+                items: vec![],
+                total_pages: Some(total_pages),
+            });
         }
 
-        let parsed = MessageParser::default().parse(raw_eml);
-        if let Some(ref msg) = parsed {
-            let body_text = msg
-                .text_bodies()
-                .map(|p| p.text_contents().unwrap_or_default().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
+        let query = self.thread_query(account_id, thread_id);
 
-            let html_text: String = msg
-                .html_bodies()
-                .map(|p| {
-                    let raw = p.text_contents().unwrap_or_default();
-                    extract_text(raw)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+        let order = if desc { Order::Desc } else { Order::Asc };
+        let thread_docs: Vec<(Option<i64>, DocAddress)> = searcher
+            .search(
+                query.as_ref(),
+                &TopDocs::with_limit(page_size as usize)
+                    .and_offset(offset as usize)
+                    .order_by_fast_field(F_DATE, order),
+            )
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        let mut result = Vec::new();
 
-            let combined = format!("{}\n{}", body_text, html_text);
-            doc.add_text(fields.f_body, &combined);
-
-            let from_contacts = extract_contacts_from_header(msg, "from");
-            let to_contacts = extract_contacts_from_header(msg, "to");
-            let cc_contacts = extract_contacts_from_header(msg, "cc");
-            let bcc_contacts = extract_contacts_from_header(msg, "bcc");
-
-            doc.add_text(fields.f_from_text, &from_contacts.join(" "));
-            doc.add_text(fields.f_to_text, &to_contacts.join(" "));
-            doc.add_text(fields.f_cc_text, &cc_contacts.join(" "));
-            doc.add_text(fields.f_bcc_text, &bcc_contacts.join(" "));
-
-            let from_hash = if let Some(addr) = msg.from().and_then(|f| f.first()) {
-                let normalized = addr
-                    .address()
-                    .map(|a| a.to_lowercase())
-                    .unwrap_or_default();
-                stable_hash_u64(&normalized)
-            } else {
-                0
-            };
-            doc.add_u64(fields.f_from, from_hash);
-
-            let mut attachment_count: u64 = 0;
-            for attachment in msg.attachments() {
-                let content_type = attachment
-                    .content_type()
-                    .map(|ct| format!("{}/{}", ct.c_type, ct.c_subtype.as_deref().unwrap_or("*")))
-                    .unwrap_or_default();
-
-                let filename = attachment
-                    .attachment_name()
-                    .unwrap_or_default()
-                    .to_lowercase();
-
-                let extension = filename
-                    .rfind('.')
-                    .map(|i| &filename[i + 1..])
-                    .unwrap_or_default()
-                    .to_string();
-
-                let category = categorize_attachment(&content_type, &extension);
-
-                let is_inline = attachment
-                    .content_disposition()
-                    .map(|d| d.c_type.eq_ignore_ascii_case("inline"))
-                    .unwrap_or(false);
-
-                if !is_inline {
-                    attachment_count += 1;
-                }
-
-                doc.add_text(fields.f_attachment_name_exact, &filename);
-                doc.add_text(fields.f_attachment_name_text, &filename);
-                doc.add_text(fields.f_attachment_ext, &extension);
-                doc.add_text(fields.f_attachment_content_type, &content_type);
-                doc.add_text(fields.f_attachment_category, &category);
-
-                let content_hash = envelope.content_hash.clone();
-                doc.add_text(fields.f_attachment_content_hash, &content_hash);
-            }
-
-            doc.add_u64(fields.f_regular_attachment_count, attachment_count);
+        for (_, doc_address) in thread_docs {
+            let doc: TantivyDocument = searcher
+                .doc(doc_address)
+                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+            let envelope = EnvelopeWithAttachments::from_tantivy_doc(&doc)?.envelope;
+            result.push(envelope);
         }
-
-        self.queue(doc).await;
-
-        Ok(())
+        Ok(DataPage {
+            current_page: Some(page),
+            page_size: Some(page_size),
+            total_items: total,
+            items: result,
+            total_pages: Some(total_pages),
+        })
     }
 
     pub fn get_dashboard_stats(
@@ -1685,6 +1611,46 @@ impl IndexManager {
         accounts: &Option<HashSet<u64>>,
     ) -> BichonResult<DashboardStats> {
         let searcher = self.create_searcher()?;
+        let now_ms = utc_now!();
+        let week_ago_ms = (Utc::now() - Duration::from_secs(60 * 60 * 24 * 30)).timestamp_millis();
+
+        let aggregations: Aggregations = serde_json::from_value(json!({
+            "total_size": {
+                "sum": { "field": F_SIZE }
+            },
+            "recent_30d_histogram": {
+                "histogram": {
+                    "field": F_DATE,
+                    "interval": 86400000,
+                    "hard_bounds": {
+                        "min": week_ago_ms,
+                        "max": now_ms
+                    }
+                }
+            },
+            "top_from_values": {
+                "terms": {
+                    "field": F_FROM,
+                    "size": 10
+                }
+            },
+            "top_account_values": {
+                "terms": {
+                    "field": F_ACCOUNT_ID,
+                    "size": 10
+                }
+            },
+            "attachment_stats": {
+                "range": {
+                    "field": F_REGULAR_ATTACHMENT_COUNT,
+                    "ranges": [
+                        { "to": 1, "key": "no_attachment" },
+                        { "from": 1, "key": "has_attachment" }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
 
         let query: Box<dyn Query> = match accounts {
             Some(ref ids) if !ids.is_empty() => {
@@ -1702,324 +1668,850 @@ impl IndexManager {
             None => Box::new(AllQuery),
         };
 
-        let now = Utc::now().timestamp();
-        let day_secs: i64 = 86_400;
-        let week_ago = now - 7 * day_secs;
-        let month_ago = now - 30 * day_secs;
-        let year_ago = now - 365 * day_secs;
-
-        let f = SchemaTools::email_fields();
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "total_count": { "value_count": { "field": F_ID } },
-            "total_size":  { "sum":         { "field": F_SIZE } },
-            "max_size":    { "max":         { "field": F_SIZE } },
-            "last_7d":  {
-                "filter": { "range": { F_INGEST_AT: { "gte": week_ago,  "lte": now } } },
-                "aggs": { "count": { "value_count": { "field": F_ID } } }
-            },
-            "last_30d": {
-                "filter": { "range": { F_INGEST_AT: { "gte": month_ago, "lte": now } } },
-                "aggs": { "count": { "value_count": { "field": F_ID } } }
-            },
-            "last_365d": {
-                "filter": { "range": { F_INGEST_AT: { "gte": year_ago,  "lte": now } } },
-                "aggs": { "count": { "value_count": { "field": F_ID } } }
-            },
-            "by_account": {
-                "terms": { "field": F_ACCOUNT_ID, "size": 100 },
-                "aggs": {
-                    "count": { "value_count": { "field": F_ID   } },
-                    "size":  { "sum":         { "field": F_SIZE } }
-                }
-            },
-            "by_date_histogram": {
-                "date_histogram": {
-                    "field": F_DATE,
-                    "fixed_interval": "86400000",
-                    "min_doc_count": 1
-                }
-            }
-        }))
-        .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-
-        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
-        let agg_res = searcher
-            .search(&query, &collector)
+        let agg_collector = AggregationCollector::from_aggs(aggregations, Default::default());
+        let agg_results = searcher
+            .search(&query, &agg_collector)
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
 
-        let total_count = Self::extract_value_count(&agg_res, "total_count")?;
+        let mut stats = DashboardStats::default();
+        let total_size = agg_results.0.get("total_size").ok_or_else(|| {
+            raise_error!(
+                "missing 'total_size' aggregation result".into(),
+                ErrorCode::InternalError
+            )
+        })?;
 
-        let total_size = {
-            let r = agg_res.0.get("total_size").ok_or_else(|| {
-                raise_error!("missing 'total_size'".into(), ErrorCode::InternalError)
+        if let AggregationResult::MetricResult(MetricResult::Sum(v)) = total_size {
+            let total_size = v.value.map(|v| v as u64).ok_or_else(|| {
+                raise_error!(
+                    "'total_size' sum metric has no value".into(),
+                    ErrorCode::InternalError
+                )
             })?;
-            match r {
-                AggregationResult::MetricResult(MetricResult::Sum(v)) => {
-                    v.value.map(|v| v as u64).unwrap_or(0)
-                }
-                _ => 0,
-            }
-        };
-
-        let max_size = {
-            let r = agg_res.0.get("max_size").ok_or_else(|| {
-                raise_error!("missing 'max_size'".into(), ErrorCode::InternalError)
-            })?;
-            match r {
-                AggregationResult::MetricResult(MetricResult::Max(v)) => {
-                    v.value.map(|v| v as u64).unwrap_or(0)
-                }
-                _ => 0,
-            }
-        };
-
-        let last_7d = Self::extract_filter_count(&agg_res, "last_7d")?;
-        let last_30d = Self::extract_filter_count(&agg_res, "last_30d")?;
-        let last_365d = Self::extract_filter_count(&agg_res, "last_365d")?;
-
-        let by_account = Self::extract_terms_groups(&agg_res, "by_account")?;
-        let by_date_histogram = Self::extract_date_histogram(&agg_res, "by_date_histogram")?;
-
-        Ok(DashboardStats {
-            total_count,
-            total_size,
-            max_size,
-            last_7d,
-            last_30d,
-            last_365d,
-            by_account,
-            by_date_histogram,
-        })
-    }
-
-    fn extract_value_count(agg_res: &AggregationResults, key: &str) -> BichonResult<u64> {
-        let result = agg_res.0.get(key).ok_or_else(|| {
-            raise_error!(
-                format!("missing '{}' aggregation result", key),
-                ErrorCode::InternalError
-            )
-        })?;
-        match result {
-            AggregationResult::MetricResult(MetricResult::Count(v)) => {
-                Ok(v.value.map(|v| v as u64).unwrap_or(0))
-            }
-            _ => Err(raise_error!(
-                format!("unexpected result type for '{}'", key),
-                ErrorCode::InternalError
-            )),
+            stats.total_size_bytes = total_size;
         }
-    }
 
-    fn extract_filter_count(agg_res: &AggregationResults, key: &str) -> BichonResult<u64> {
-        let result = agg_res.0.get(key).ok_or_else(|| {
+        let recent_30d_histogram = agg_results.0.get("recent_30d_histogram").ok_or_else(|| {
             raise_error!(
-                format!("missing '{}' aggregation result", key),
+                "missing 'recent_30d_histogram' aggregation result".into(),
                 ErrorCode::InternalError
             )
         })?;
-        match result {
-            AggregationResult::BucketResult(BucketResult::Filter(filter)) => {
-                let sub = filter.buckets.0.get("count").ok_or_else(|| {
-                    raise_error!(
-                        format!("missing 'count' sub-aggregation in '{}'", key),
-                        ErrorCode::InternalError
-                    )
-                })?;
-                match sub {
-                    AggregationResult::MetricResult(MetricResult::Count(v)) => {
-                        Ok(v.value.map(|v| v as u64).unwrap_or(0))
-                    }
-                    _ => Err(raise_error!(
-                        format!("unexpected sub-result type for '{}' count", key),
-                        ErrorCode::InternalError
-                    )),
-                }
-            }
-            _ => Err(raise_error!(
-                format!("unexpected result type for '{}'", key),
-                ErrorCode::InternalError
-            )),
-        }
-    }
 
-    fn extract_terms_groups(agg_res: &AggregationResults, key: &str) -> BichonResult<Vec<Group>> {
-        let result = agg_res.0.get(key).ok_or_else(|| {
-            raise_error!(
-                format!("missing '{}' aggregation result", key),
-                ErrorCode::InternalError
-            )
-        })?;
-        match result {
-            AggregationResult::BucketResult(BucketResult::Terms(terms)) => {
-                let mut groups = Vec::new();
-                if let BucketEntries::U64(entries) = &terms.buckets {
-                    for bucket in entries {
-                        let count_val = bucket.sub_aggregations.0.get("count").and_then(|r| {
-                            if let AggregationResult::MetricResult(MetricResult::Count(v)) = r {
-                                v.value.map(|v| v as u64)
-                            } else {
-                                None
-                            }
-                        }).unwrap_or(0);
-
-                        let size_val = bucket.sub_aggregations.0.get("size").and_then(|r| {
-                            if let AggregationResult::MetricResult(MetricResult::Sum(v)) = r {
-                                v.value.map(|v| v as u64)
-                            } else {
-                                None
-                            }
-                        }).unwrap_or(0);
-
-                        groups.push(Group {
-                            key: bucket.key.to_string(),
-                            count: count_val,
-                            size: size_val,
+        let mut recent_activity = Vec::with_capacity(31);
+        if let AggregationResult::BucketResult(BucketResult::Histogram { buckets, .. }) =
+            recent_30d_histogram
+        {
+            if let BucketEntries::Vec(bucket_list) = buckets {
+                for entry in bucket_list {
+                    if let Key::F64(ms) = entry.key {
+                        recent_activity.push(TimeBucket {
+                            timestamp_ms: ms as i64,
+                            count: entry.doc_count,
                         });
                     }
                 }
-                Ok(groups)
             }
-            _ => Err(raise_error!(
-                format!("unexpected result type for '{}'", key),
-                ErrorCode::InternalError
-            )),
         }
-    }
-
-    fn extract_date_histogram(
-        agg_res: &AggregationResults,
-        key: &str,
-    ) -> BichonResult<Vec<TimeBucket>> {
-        let result = agg_res.0.get(key).ok_or_else(|| {
-            raise_error!(
-                format!("missing '{}' aggregation result", key),
-                ErrorCode::InternalError
-            )
-        })?;
-        match result {
-            AggregationResult::BucketResult(BucketResult::Histogram(hist)) => {
-                let mut buckets = Vec::new();
-                for bucket in &hist.buckets {
-                    let ts = match &bucket.key {
-                        Key::F64(v) => (*v / 1000.0) as i64,
-                        Key::Str(s) => s.parse::<i64>().unwrap_or(0),
-                    };
-                    buckets.push(TimeBucket {
-                        timestamp: ts,
-                        count: bucket.doc_count,
+        stats.recent_activity = recent_activity;
+        let mut top_senders = Vec::with_capacity(11);
+        let top_from_values = agg_results.0.get("top_from_values").unwrap();
+        if let AggregationResult::BucketResult(BucketResult::Terms { buckets, .. }) =
+            top_from_values
+        {
+            for entry in buckets {
+                if let Key::Str(sender) = &entry.key {
+                    top_senders.push(Group {
+                        key: sender.clone(),
+                        count: entry.doc_count,
                     });
                 }
-                Ok(buckets)
             }
-            _ => Err(raise_error!(
-                format!("unexpected result type for '{}'", key),
-                ErrorCode::InternalError
-            )),
         }
+        stats.top_senders = top_senders;
+
+        let mut top_accounts = Vec::with_capacity(11);
+        let top_account_values = agg_results.0.get("top_account_values").unwrap();
+        if let AggregationResult::BucketResult(BucketResult::Terms { buckets, .. }) =
+            top_account_values
+        {
+            for entry in buckets {
+                if let Key::U64(account_id) = &entry.key {
+                    match AccountModel::get(*account_id) {
+                        Ok(account) => {
+                            top_accounts.push(Group {
+                                key: account.email,
+                                count: entry.doc_count,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                account_id = account_id,
+                                error = %e,
+                                "orphaned account index detected, scheduling cleanup"
+                            );
+                            let account_id = *account_id;
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    ENVELOPE_MANAGER.delete_account_envelopes(account_id).await
+                                {
+                                    tracing::error!(
+                                        account_id = account_id,
+                                        error = %e,
+                                        "failed to cleanup envelope index"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        stats.top_accounts = top_accounts;
+
+        let attachment_stats = agg_results.0.get("attachment_stats").unwrap();
+        if let AggregationResult::BucketResult(BucketResult::Range { buckets, .. }) =
+            attachment_stats
+        {
+            match buckets {
+                BucketEntries::Vec(bucket_vec) => {
+                    for entry in bucket_vec {
+                        match entry.key.to_string().as_str() {
+                            "no_attachment" => {
+                                stats.without_attachment_count = entry.doc_count;
+                            }
+                            "has_attachment" => {
+                                stats.with_attachment_count = entry.doc_count;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                BucketEntries::HashMap(bucket_map) => {
+                    if let Some(entry) = bucket_map.get("no_attachment") {
+                        stats.without_attachment_count = entry.doc_count;
+                    }
+                    if let Some(entry) = bucket_map.get("has_attachment") {
+                        stats.with_attachment_count = entry.doc_count;
+                    }
+                }
+            }
+        }
+        Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::tantivy::tokenizers::EuroTokenizer;
+    use serde_json::json;
+    use tantivy::{
+        collector::Count,
+        query::{QueryParser, TermQuery},
+        schema::IndexRecordOption,
+        Index, Term,
+    };
+
+    /// Build a complete test document with known values across all
+    /// stored and non-stored fields so we can verify reconstruction.
+    fn build_test_doc() -> TantivyDocument {
+        let f = SchemaTools::email_fields();
+        let mut doc = TantivyDocument::new();
+
+        doc.add_text(f.f_id, "test-eid-001");
+        doc.add_text(f.f_message_id, "<test@msg.id>");
+        doc.add_u64(f.f_account_id, 1);
+        doc.add_u64(f.f_mailbox_id, 10);
+        doc.add_u64(f.f_uid, 100);
+        doc.add_text(f.f_subject, "Test Subject Line");
+        doc.add_text(f.f_body, "the quick brown fox jumps over the lazy dog");
+        doc.add_text(f.f_preview, "the quick brown fox...");
+        doc.add_text(f.f_content_hash, "test-content-hash-001");
+        // f_from / f_from_text carry the same data
+        doc.add_text(f.f_from, "alice@example.com");
+        doc.add_text(f.f_from_text, "alice@example.com");
+        doc.add_text(f.f_to, "bob@example.com");
+        doc.add_text(f.f_to_text, "bob@example.com");
+        doc.add_text(f.f_cc, "carol@example.com");
+        doc.add_text(f.f_cc_text, "carol@example.com");
+        doc.add_text(f.f_bcc, "dave@example.com");
+        doc.add_text(f.f_bcc_text, "dave@example.com");
+        doc.add_i64(f.f_date, 1_700_000_000_000);
+        doc.add_i64(f.f_internal_date, 1_700_000_000_000);
+        doc.add_i64(f.f_ingest_at, 1_700_000_000_000);
+        doc.add_u64(f.f_size, 999);
+        doc.add_text(f.f_thread_id, "thread-xyz");
+
+        // Attachment metadata (stored as JSON).
+        let atts = json!([{
+            "filename": "invoice.pdf",
+            "file_type": "application/pdf",
+            "inline": false,
+            "size": 5000,
+            "content_id": null,
+            "content_hash": "att-hash-pdf",
+            "is_message": false
+        }]);
+        doc.add_text(f.f_attachments, atts.to_string());
+        doc.add_text(f.f_attachment_name_text, "invoice.pdf");
+        doc.add_text(f.f_attachment_name_exact, "invoice.pdf");
+        doc.add_text(f.f_attachment_ext, "pdf");
+        doc.add_text(f.f_attachment_category, "document");
+        doc.add_text(f.f_attachment_content_type, "application/pdf");
+        doc.add_text(f.f_attachment_content_hash, "att-hash-pdf");
+        doc.add_u64(f.f_attachment_count, 1);
+        doc.add_u64(f.f_regular_attachment_count, 1);
+        doc.add_u64(f.f_shard_id, 0);
+
+        // Initial tags.
+        doc.add_facet(f.f_tags, "/inbox");
+        doc.add_facet(f.f_tags, "/unread");
+
+        doc
     }
 
-    pub fn migrate_account(&self, model: &AccountModel) -> BichonResult<()> {
-        warn!("Migrating account {} in Tantivy index", model.id);
-        let searcher = self.create_searcher()?;
-        let query = self.account_query(model.id);
+    /// Reconstruct a new tantivy document from `old_doc`, preserving all
+    /// fields (including non-stored ones) and replacing tags with
+    /// `new_tags`.  Body text is reconstructed from the supplied `eml_cache`
+    /// (a stand-in for the blob store) rather than from
+    /// `old_doc.field_values()` because `f_body` is not STORED.
+    fn reconstruct_for_test(
+        old_doc: &TantivyDocument,
+        new_tags: &HashSet<String>,
+        eml_cache: &HashMap<String, Vec<u8>>,
+    ) -> TantivyDocument {
+        let f = SchemaTools::email_fields();
+        let mut new_doc = TantivyDocument::new();
+
+        // ── stored fields (except f_tags) ──────────────────────────
+        for (field, value) in old_doc.field_values() {
+            if field != f.f_tags {
+                new_doc.add_field_value(field, value);
+            }
+        }
+
+        // ── non-stored text-search fields ──────────────────────────
+        for val in old_doc.get_all(f.f_from) {
+            if let Some(s) = val.as_str() {
+                new_doc.add_text(f.f_from_text, s);
+            }
+        }
+        for val in old_doc.get_all(f.f_to) {
+            if let Some(s) = val.as_str() {
+                new_doc.add_text(f.f_to_text, s);
+            }
+        }
+        for val in old_doc.get_all(f.f_cc) {
+            if let Some(s) = val.as_str() {
+                new_doc.add_text(f.f_cc_text, s);
+            }
+        }
+        for val in old_doc.get_all(f.f_bcc) {
+            if let Some(s) = val.as_str() {
+                new_doc.add_text(f.f_bcc_text, s);
+            }
+        }
+
+        // ── attachment-name fields ─────────────────────────────────
+        if let Some(attrs_val) = old_doc.get_first(f.f_attachments) {
+            if let Some(json_str) = attrs_val.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(arr) = parsed.as_array() {
+                        for att in arr {
+                            let is_inline =
+                                att.get("inline").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let has_cid = att
+                                .get("content_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false);
+                            if is_inline && has_cid {
+                                continue;
+                            }
+                            if let Some(filename) = att
+                                .get("filename")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                            {
+                                new_doc.add_text(f.f_attachment_name_text, filename);
+                                new_doc.add_text(f.f_attachment_name_exact, filename);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── body text (from eml cache – stands in for BLOB_MANAGER) ──
+        if let Some(hash_val) = old_doc.get_first(f.f_content_hash) {
+            if let Some(content_hash) = hash_val.as_str() {
+                if let Some(eml_bytes) = eml_cache.get(content_hash) {
+                    if let Some(message) = MessageParser::new().parse(eml_bytes) {
+                        let text = message
+                            .body_text(0)
+                            .map(|cow| cow.into_owned())
+                            .or_else(|| {
+                                message
+                                    .body_html(0)
+                                    .map(|cow| extract_text(cow.into_owned()))
+                            })
+                            .unwrap_or_default();
+                        let body_text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        if !body_text.is_empty() {
+                            new_doc.add_text(f.f_body, &body_text);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── updated tags ───────────────────────────────────────────
+        for tag in new_tags {
+            new_doc.add_facet(f.f_tags, tag);
+        }
+
+        new_doc
+    }
+
+    #[test]
+    fn update_tags_preserves_non_stored_fields() {
         let f = SchemaTools::email_fields();
 
-        let docs: Vec<DocAddress> = searcher
-            .search(&query, &DocSetCollector)
-            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?
-            .into_iter()
-            .collect();
+        // ---- setup: in-memory index + document --------------------
+        let index = Index::create_in_ram(SchemaTools::email_schema());
+        index.tokenizers().register("euro", EuroTokenizer::new());
 
-        let writer = self.index_writer.blocking_lock();
+        {
+            let mut writer = index
+                .writer_with_num_threads(1, 15_000_000)
+                .expect("writer");
+            let doc = build_test_doc();
+            writer.add_document(doc).unwrap();
+            writer.commit().unwrap();
+        } // drop writer so the next one can acquire the lock
 
-        for doc_address in docs {
-            let existing_doc: TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        // ---- build a minimal EML so body reconstruction works ------
+        let eml = b"From: alice@example.com\r\n\
+                         To: bob@example.com\r\n\
+                         Subject: Test\r\n\
+                         Date: Thu, 01 Jan 2023 00:00:00 +0000\r\n\
+                         Message-ID: <test@msg.id>\r\n\
+                         \r\n\
+                         the quick brown fox jumps over the lazy dog\r\n";
+        let mut eml_cache = HashMap::new();
+        eml_cache.insert("test-content-hash-001".to_string(), eml.to_vec());
 
-            let mut envelope = EnvelopeWithAttachments::from_tantivy_doc(&existing_doc)?;
+        // ---- read old doc, reconstruct, delete + add --------------
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(f.f_id, "test-eid-001"),
+            IndexRecordOption::Basic,
+        );
+        let hits = searcher
+            .search(&query, &TopDocs::with_limit(1).order_by_score())
+            .unwrap();
+        assert_eq!(hits.len(), 1);
 
-            for (old_tag, new_tag) in &model.tag_migrations {
-                if let Some(pos) = envelope.tags.iter().position(|t| t == old_tag) {
-                    envelope.tags[pos] = new_tag.clone();
-                }
-            }
+        let old_doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
 
-            writer
-                .delete_query(self.envelope_query(model.id, &envelope.id))
-                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        let mut new_tags = HashSet::new();
+        new_tags.insert("/important".to_string());
+        new_tags.insert("/inbox".to_string());
 
-            let new_doc = envelope.to_tantivy_doc()?;
-            writer
-                .add_document(new_doc)
-                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        let new_doc = reconstruct_for_test(&old_doc, &new_tags, &eml_cache);
+
+        let mut writer2 = index
+            .writer_with_num_threads(1, 15_000_000)
+            .expect("writer2");
+        writer2.delete_term(Term::from_field_text(f.f_id, "test-eid-001"));
+        writer2.add_document(new_doc).unwrap();
+        writer2.commit().unwrap();
+
+        // ---- verify: search for non-stored fields still works -----
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        // Body text (tokenized via "euro")
+        let body_parser = QueryParser::for_index(&index, vec![f.f_body]);
+        let body_hits = searcher
+            .search(&body_parser.parse_query("quick brown fox").unwrap(), &Count)
+            .unwrap();
+        assert_eq!(body_hits, 1, "body text should survive tag update");
+
+        // from_text (tokenized via "euro")
+        let from_parser = QueryParser::for_index(&index, vec![f.f_from_text]);
+        let from_hits = searcher
+            .search(
+                &from_parser.parse_query("alice@example.com").unwrap(),
+                &Count,
+            )
+            .unwrap();
+        assert_eq!(from_hits, 1, "from_text should survive tag update");
+
+        // to_text
+        let to_parser = QueryParser::for_index(&index, vec![f.f_to_text]);
+        let to_hits = searcher
+            .search(&to_parser.parse_query("bob@example.com").unwrap(), &Count)
+            .unwrap();
+        assert_eq!(to_hits, 1, "to_text should survive tag update");
+
+        // attachment_name_exact (STRING — not tokenized)
+        let att_hits = searcher
+            .search(
+                &TermQuery::new(
+                    Term::from_field_text(f.f_attachment_name_exact, "invoice.pdf"),
+                    IndexRecordOption::Basic,
+                ),
+                &Count,
+            )
+            .unwrap();
+        assert_eq!(
+            att_hits, 1,
+            "attachment_name_exact should survive tag update"
+        );
+
+        // Updated tags
+        let tags_hits = searcher
+            .search(
+                &TermQuery::new(
+                    Term::from_facet(f.f_tags, &Facet::from_text("/important").unwrap()),
+                    IndexRecordOption::Basic,
+                ),
+                &Count,
+            )
+            .unwrap();
+        assert_eq!(tags_hits, 1, "new tag /important should be present");
+
+        // Old tag /unread should be gone since we overwrote with new_tags
+        let old_tag_hits = searcher
+            .search(
+                &TermQuery::new(
+                    Term::from_facet(f.f_tags, &Facet::from_text("/unread").unwrap()),
+                    IndexRecordOption::Basic,
+                ),
+                &Count,
+            )
+            .unwrap();
+        assert_eq!(old_tag_hits, 0, "old tag /unread should have been removed");
+    }
+
+    #[test]
+    fn body_reconstruction_from_eml_cache() {
+        // Verify the EML → body_text extraction used inside
+        // reconstruct_for_test (and therefore update_envelope_tags).
+        let eml = b"From: x@y\r\n\
+                         Subject: testing\r\n\
+                         Date: Thu, 01 Jan 2023 00:00:00 +0000\r\n\
+                         \r\n\
+                         hello world from the test suite\r\n";
+
+        let mut cache = HashMap::new();
+        cache.insert("hash-abc".to_string(), eml.to_vec());
+
+        let f = SchemaTools::email_fields();
+        let mut old = TantivyDocument::new();
+        old.add_text(f.f_content_hash, "hash-abc");
+
+        let reconstructed = reconstruct_for_test(&old, &HashSet::new(), &cache);
+
+        // The body should have been extracted from the EML and added
+        // back to the document.  Search for it.
+        let index = Index::create_in_ram(SchemaTools::email_schema());
+        index.tokenizers().register("euro", EuroTokenizer::new());
+        let mut writer = index
+            .writer_with_num_threads(1, 15_000_000)
+            .expect("writer");
+        writer.add_document(reconstructed).unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(&index, vec![f.f_body]);
+        let hits = searcher
+            .search(&parser.parse_query("hello world").unwrap(), &Count)
+            .unwrap();
+        assert_eq!(hits, 1, "body text should be reconstructed from EML");
+    }
+
+    #[test]
+    fn body_reconstruction_missing_eml_is_graceful() {
+        // When the EML is not in the cache (simulating a blob-store
+        // miss), the document should still be produced without body.
+        let f = SchemaTools::email_fields();
+        let mut old = TantivyDocument::new();
+        old.add_text(f.f_content_hash, "nonexistent-hash");
+
+        let cache = HashMap::new(); // empty
+        let reconstructed = reconstruct_for_test(&old, &HashSet::new(), &cache);
+
+        // The document exists but has no body field.
+        let body_vals: Vec<_> = reconstructed.get_all(f.f_body).collect();
+        assert!(
+            body_vals.is_empty(),
+            "body should be absent when EML is missing"
+        );
+    }
+
+    // ── get_message_ids_for_mailbox ─────────────────────────────────
+
+    #[test]
+    fn get_message_ids_returns_stored_ids() {
+        let f = SchemaTools::email_fields();
+        let index = Index::create_in_ram(SchemaTools::email_schema());
+        index.tokenizers().register("euro", EuroTokenizer::new());
+
+        // Insert two docs for mailbox 10, one for mailbox 20
+        {
+            let mut writer = index
+                .writer_with_num_threads(1, 15_000_000)
+                .expect("writer");
+
+            let mut doc1 = TantivyDocument::new();
+            doc1.add_u64(f.f_account_id, 1);
+            doc1.add_u64(f.f_mailbox_id, 10);
+            doc1.add_text(f.f_message_id, "<msg-a@test>");
+            doc1.add_text(f.f_id, "id-a");
+            doc1.add_u64(f.f_uid, 1);
+            doc1.add_text(f.f_content_hash, "hash-a");
+            writer.add_document(doc1).unwrap();
+
+            let mut doc2 = TantivyDocument::new();
+            doc2.add_u64(f.f_account_id, 1);
+            doc2.add_u64(f.f_mailbox_id, 10);
+            doc2.add_text(f.f_message_id, "<msg-b@test>");
+            doc2.add_text(f.f_id, "id-b");
+            doc2.add_u64(f.f_uid, 2);
+            doc2.add_text(f.f_content_hash, "hash-b");
+            writer.add_document(doc2).unwrap();
+
+            let mut doc3 = TantivyDocument::new();
+            doc3.add_u64(f.f_account_id, 1);
+            doc3.add_u64(f.f_mailbox_id, 20);
+            doc3.add_text(f.f_message_id, "<msg-c@test>");
+            doc3.add_text(f.f_id, "id-c");
+            doc3.add_u64(f.f_uid, 3);
+            doc3.add_text(f.f_content_hash, "hash-c");
+            writer.add_document(doc3).unwrap();
+
+            writer.commit().unwrap();
         }
 
-        let mut writer = self.index_writer.blocking_lock();
-        writer
-            .commit()
-            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
 
-        Ok(())
-    }
-}
+        // We can't easily call ENVELOPE_MANAGER.get_message_ids_for_mailbox
+        // because it reads from ENVELOPE_MANAGER's own index, not our in-memory one.
+        // Instead, test the query pattern directly.
+        let query: Box<dyn Query> = {
+            let account_query = TermQuery::new(
+                Term::from_field_u64(f.f_account_id, 1),
+                IndexRecordOption::Basic,
+            );
+            let mailbox_query = TermQuery::new(
+                Term::from_field_u64(f.f_mailbox_id, 10),
+                IndexRecordOption::Basic,
+            );
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(account_query)),
+                (Occur::Must, Box::new(mailbox_query)),
+            ]))
+        };
 
-fn extract_contacts_from_header(msg: &mail_parser::Message, header: &str) -> Vec<String> {
-    msg.header(header)
-        .and_then(|h| {
-            if let mail_parser::HeaderValue::AddressList(addrs) = &h.value {
-                Some(
-                    addrs
-                        .iter()
-                        .flat_map(|a| {
-                            let mut parts = Vec::new();
-                            if let Some(name) = &a.name {
-                                parts.push(name.to_string());
-                            }
-                            if let Some(addr) = &a.address {
-                                parts.push(addr.to_string());
-                            }
-                            parts
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            } else if let mail_parser::HeaderValue::Address(addr) = &h.value {
-                let mut parts = Vec::new();
-                if let Some(name) = &addr.name {
-                    parts.push(name.to_string());
+        let docs = searcher
+            .search(&query, &DocSetCollector)
+            .unwrap();
+
+        let mut ids: Vec<String> = Vec::new();
+        for addr in docs {
+            let doc: TantivyDocument = searcher.doc(addr).unwrap();
+            if let Some(v) = doc.get_first(f.f_message_id) {
+                if let Some(s) = v.as_str() {
+                    ids.push(s.to_string());
                 }
-                if let Some(a) = &addr.address {
-                    parts.push(a.to_string());
-                }
-                Some(parts)
-            } else {
-                None
             }
-        })
-        .unwrap_or_default()
-}
+        }
+        ids.sort();
 
-fn stable_hash_u64(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
-}
+        assert_eq!(ids, vec!["<msg-a@test>", "<msg-b@test>"]);
+    }
 
-fn categorize_attachment(content_type: &str, extension: &str) -> String {
-    match content_type.split('/').next().unwrap_or("") {
-        "image" => "image".to_string(),
-        "video" => "video".to_string(),
-        "audio" => "audio".to_string(),
-        "text" => "text".to_string(),
-        _ => match extension {
-            "pdf" => "pdf".to_string(),
-            "doc" | "docx" | "odt" | "rtf" => "document".to_string(),
-            "xls" | "xlsx" | "ods" | "csv" => "spreadsheet".to_string(),
-            "ppt" | "pptx" | "odp" => "presentation".to_string(),
-            "zip" | "tar" | "gz" | "rar" | "7z" => "archive".to_string(),
-            "exe" | "dmg" | "pkg" | "deb" | "rpm" => "executable".to_string(),
-            _ => "other".to_string(),
-        },
+    #[test]
+    fn get_message_ids_empty_mailbox_returns_empty() {
+        let f = SchemaTools::email_fields();
+        let index = Index::create_in_ram(SchemaTools::email_schema());
+        index.tokenizers().register("euro", EuroTokenizer::new());
+
+        {
+            let mut writer = index
+                .writer_with_num_threads(1, 15_000_000)
+                .expect("writer");
+
+            // Doc for a different mailbox
+            let mut doc = TantivyDocument::new();
+            doc.add_u64(f.f_account_id, 1);
+            doc.add_u64(f.f_mailbox_id, 99);
+            doc.add_text(f.f_message_id, "<other@test>");
+            doc.add_text(f.f_id, "id-other");
+            doc.add_u64(f.f_uid, 1);
+            doc.add_text(f.f_content_hash, "hash-other");
+            writer.add_document(doc).unwrap();
+            writer.commit().unwrap();
+        }
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        let query: Box<dyn Query> = {
+            let account_query = TermQuery::new(
+                Term::from_field_u64(f.f_account_id, 1),
+                IndexRecordOption::Basic,
+            );
+            let mailbox_query = TermQuery::new(
+                Term::from_field_u64(f.f_mailbox_id, 10),
+                IndexRecordOption::Basic,
+            );
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(account_query)),
+                (Occur::Must, Box::new(mailbox_query)),
+            ]))
+        };
+
+        let docs = searcher.search(&query, &DocSetCollector).unwrap();
+        assert!(docs.is_empty());
+    }
+
+    // ── mailbox_contains_message_id ───────────────────────────────
+
+    #[test]
+    fn mailbox_contains_message_id_finds_existing() {
+        let f = SchemaTools::email_fields();
+        let index = Index::create_in_ram(SchemaTools::email_schema());
+        index.tokenizers().register("euro", EuroTokenizer::new());
+
+        {
+            let mut writer = index
+                .writer_with_num_threads(1, 15_000_000)
+                .expect("writer");
+
+            let mut doc = TantivyDocument::new();
+            doc.add_u64(f.f_account_id, 1);
+            doc.add_u64(f.f_mailbox_id, 10);
+            doc.add_text(f.f_message_id, "abc@example.com");
+            doc.add_text(f.f_id, "id-1");
+            doc.add_u64(f.f_uid, 1);
+            doc.add_text(f.f_content_hash, "hash-1");
+            writer.add_document(doc).unwrap();
+            writer.commit().unwrap();
+        }
+
+        // We test the query pattern directly (can't call ENVELOPE_MANAGER
+        // which uses a different index).
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_account_id, 1),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_mailbox_id, 10),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(f.f_message_id, "abc@example.com"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+
+        let count = searcher.search(&query, &Count).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mailbox_contains_message_id_returns_zero_for_missing() {
+        let f = SchemaTools::email_fields();
+        let index = Index::create_in_ram(SchemaTools::email_schema());
+        index.tokenizers().register("euro", EuroTokenizer::new());
+
+        {
+            let mut writer = index
+                .writer_with_num_threads(1, 15_000_000)
+                .expect("writer");
+
+            let mut doc = TantivyDocument::new();
+            doc.add_u64(f.f_account_id, 1);
+            doc.add_u64(f.f_mailbox_id, 10);
+            doc.add_text(f.f_message_id, "existing@example.com");
+            doc.add_text(f.f_id, "id-1");
+            doc.add_u64(f.f_uid, 1);
+            doc.add_text(f.f_content_hash, "hash-1");
+            writer.add_document(doc).unwrap();
+            writer.commit().unwrap();
+        }
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_account_id, 1),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_mailbox_id, 10),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(f.f_message_id, "nonexistent@example.com"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+
+        let count = searcher.search(&query, &Count).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn mailbox_contains_message_id_respects_mailbox_boundary() {
+        let f = SchemaTools::email_fields();
+        let index = Index::create_in_ram(SchemaTools::email_schema());
+        index.tokenizers().register("euro", EuroTokenizer::new());
+
+        {
+            let mut writer = index
+                .writer_with_num_threads(1, 15_000_000)
+                .expect("writer");
+
+            // Same Message-ID in mailbox 10
+            let mut doc1 = TantivyDocument::new();
+            doc1.add_u64(f.f_account_id, 1);
+            doc1.add_u64(f.f_mailbox_id, 10);
+            doc1.add_text(f.f_message_id, "shared@example.com");
+            doc1.add_text(f.f_id, "id-1");
+            doc1.add_u64(f.f_uid, 1);
+            doc1.add_text(f.f_content_hash, "hash-1");
+            writer.add_document(doc1).unwrap();
+
+            // Same Message-ID in mailbox 20 (different mailbox)
+            let mut doc2 = TantivyDocument::new();
+            doc2.add_u64(f.f_account_id, 1);
+            doc2.add_u64(f.f_mailbox_id, 20);
+            doc2.add_text(f.f_message_id, "shared@example.com");
+            doc2.add_text(f.f_id, "id-2");
+            doc2.add_u64(f.f_uid, 2);
+            doc2.add_text(f.f_content_hash, "hash-2");
+            writer.add_document(doc2).unwrap();
+            writer.commit().unwrap();
+        }
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        // Query mailbox 10: should find 1
+        let q10 = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_account_id, 1),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_mailbox_id, 10),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(f.f_message_id, "shared@example.com"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        assert_eq!(searcher.search(&q10, &Count).unwrap(), 1);
+
+        // Query mailbox 20: should find 1
+        let q20 = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_account_id, 1),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_mailbox_id, 20),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(f.f_message_id, "shared@example.com"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        assert_eq!(searcher.search(&q20, &Count).unwrap(), 1);
+
+        // Query mailbox 99 (no docs): should find 0
+        let q99 = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_account_id, 1),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(f.f_mailbox_id, 99),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(f.f_message_id, "shared@example.com"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        assert_eq!(searcher.search(&q99, &Count).unwrap(), 0);
     }
 }
